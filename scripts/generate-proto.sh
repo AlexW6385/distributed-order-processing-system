@@ -10,8 +10,8 @@ export PATH
 mkdir -p gen
 
 protoc \
-  --go_out=. --go_opt=module=github.com/AlexW6385/Distributed-Order-Processing-System \
-  --go-grpc_out=. --go-grpc_opt=module=github.com/AlexW6385/Distributed-Order-Processing-System \
+  --go_out=. --go_opt=module=github.com/AlexW6385/distributed-order-processing-system \
+  --go-grpc_out=. --go-grpc_opt=module=github.com/AlexW6385/distributed-order-processing-system \
   proto/product/v1/product.proto \
   proto/payment/v1/payment.proto \
   proto/order/v1/order.proto

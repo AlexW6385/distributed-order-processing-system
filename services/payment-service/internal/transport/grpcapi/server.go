@@ -3,8 +3,8 @@ package grpcapi
 import (
 	"context"
 
-	paymentv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/payment/v1"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/payment-service/internal/service"
+	paymentv1 "github.com/AlexW6385/distributed-order-processing-system/gen/payment/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/service"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

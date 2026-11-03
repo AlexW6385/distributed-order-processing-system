@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/product-service/internal/domain"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/domain"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"

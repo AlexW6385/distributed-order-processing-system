@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package order.v1;
 
-option go_package = "github.com/AlexW6385/Distributed-Order-Processing-System/gen/order/v1;orderv1";
+option go_package = "github.com/AlexW6385/distributed-order-processing-system/gen/order/v1;orderv1";
 
 service OrderService {
   rpc CreateOrder(CreateOrderRequest) returns (OrderResponse);

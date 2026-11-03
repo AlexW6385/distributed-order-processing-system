@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/logging"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/order-service/internal/domain"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
+	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/domain"
 )
 
 func TestCreateOrderMarksFailedWhenStockReservationFails(t *testing.T) {

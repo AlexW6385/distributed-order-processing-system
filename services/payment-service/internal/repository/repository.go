@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/payment-service/internal/domain"
+	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/domain"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"

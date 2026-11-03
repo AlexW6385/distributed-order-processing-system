@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/product-service/internal/domain"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/domain"
 )
 
 type Repository interface {

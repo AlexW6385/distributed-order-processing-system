@@ -1,4 +1,4 @@
-module github.com/AlexW6385/Distributed-Order-Processing-System
+module github.com/AlexW6385/distributed-order-processing-system
 
 go 1.23.0
 

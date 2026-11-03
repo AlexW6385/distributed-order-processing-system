@@ -3,9 +3,9 @@ package httpapi
 import (
 	"net/http"
 
-	orderv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/order/v1"
-	productv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/product/v1"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/httpjson"
+	orderv1 "github.com/AlexW6385/distributed-order-processing-system/gen/order/v1"
+	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/httpjson"
 	"github.com/gin-gonic/gin"
 )
 

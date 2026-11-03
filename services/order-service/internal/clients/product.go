@@ -3,8 +3,8 @@ package clients
 import (
 	"context"
 
-	productv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/product/v1"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/order-service/internal/domain"
+	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/domain"
 )
 
 type ProductClient struct {

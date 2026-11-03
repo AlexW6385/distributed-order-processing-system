@@ -3,7 +3,7 @@ package clients
 import (
 	"context"
 
-	paymentv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/payment/v1"
+	paymentv1 "github.com/AlexW6385/distributed-order-processing-system/gen/payment/v1"
 )
 
 type PaymentClient struct {

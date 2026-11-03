@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"net"
 
-	productv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/product/v1"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/config"
-	platformdb "github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/db"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/logging"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/product-service/internal/repository"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/product-service/internal/service"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/product-service/internal/transport/grpcapi"
+	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/config"
+	platformdb "github.com/AlexW6385/distributed-order-processing-system/internal/platform/db"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/repository"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/service"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/transport/grpcapi"
 	"google.golang.org/grpc"
 )
 

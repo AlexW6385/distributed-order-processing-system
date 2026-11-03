@@ -3,9 +3,9 @@ package grpcapi
 import (
 	"context"
 
-	productv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/product/v1"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/product-service/internal/domain"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/product-service/internal/service"
+	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/domain"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/service"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

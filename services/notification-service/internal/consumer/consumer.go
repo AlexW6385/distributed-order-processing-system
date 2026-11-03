@@ -3,7 +3,7 @@ package consumer
 import (
 	"context"
 
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/logging"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/segmentio/kafka-go"
 )
 

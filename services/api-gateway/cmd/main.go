@@ -3,11 +3,11 @@ package main
 import (
 	"fmt"
 
-	orderv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/order/v1"
-	productv1 "github.com/AlexW6385/Distributed-Order-Processing-System/gen/product/v1"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/config"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/logging"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/api-gateway/internal/httpapi"
+	orderv1 "github.com/AlexW6385/distributed-order-processing-system/gen/order/v1"
+	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/config"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
+	"github.com/AlexW6385/distributed-order-processing-system/services/api-gateway/internal/httpapi"
 	"github.com/gin-gonic/gin"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

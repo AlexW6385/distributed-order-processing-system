@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package payment.v1;
 
-option go_package = "github.com/AlexW6385/Distributed-Order-Processing-System/gen/payment/v1;paymentv1";
+option go_package = "github.com/AlexW6385/distributed-order-processing-system/gen/payment/v1;paymentv1";
 
 service PaymentService {
   rpc PayOrder(PayOrderRequest) returns (PayOrderResponse);

@@ -7,10 +7,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/config"
-	platformkafka "github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/kafka"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/internal/platform/logging"
-	"github.com/AlexW6385/Distributed-Order-Processing-System/services/notification-service/internal/consumer"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/config"
+	platformkafka "github.com/AlexW6385/distributed-order-processing-system/internal/platform/kafka"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
+	"github.com/AlexW6385/distributed-order-processing-system/services/notification-service/internal/consumer"
 	"github.com/segmentio/kafka-go"
 )
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/domain"
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/flashsale"
@@ -134,9 +135,14 @@ func (s *Service) admit(ctx context.Context, orderID, customer string, lines []d
 }
 
 func (s *Service) undo(ctx context.Context, orderID, customer string, lines []domain.ReservationLine) {
-	if s.gate == nil {
+	if s.gate == nil || len(lines) == 0 {
 		return
 	}
+	// The units must go back even when the request that took them was
+	// cancelled (its deadline passed mid-reservation). Using the request's
+	// context here lost them: the sale silently undersold.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
 	for _, line := range lines {
 		if err := s.gate.Undo(ctx, line.ProductID, orderID, customer, line.Quantity); err != nil {
 			slog.WarnContext(ctx, "return flash-sale units failed", "order_id", orderID, "error", err)

@@ -61,7 +61,14 @@ func flashsale(ctx context.Context, o options) bool {
 		go func(i int) {
 			defer wg.Done()
 			<-gate
-			code, _, d, err := createOrderFor(o.base, fmt.Sprintf("buyer-%d-%d@example.com", run, i), product, 1)
+			// Buyers retry a 503 (nothing happened, try again) but accept 409.
+			email := fmt.Sprintf("buyer-%d-%d@example.com", run, i)
+			code, _, d, err := createOrderFor(o.base, email, product, 1)
+			for attempt := 0; code == http.StatusServiceUnavailable && attempt < 50; attempt++ {
+				rec.add("create", code, err, d)
+				time.Sleep(time.Duration(100+rand.IntN(200)) * time.Millisecond)
+				code, _, d, err = createOrderFor(o.base, email, product, 1)
+			}
 			rec.add("create", code, err, d)
 			if code == http.StatusCreated {
 				created.Add(1)

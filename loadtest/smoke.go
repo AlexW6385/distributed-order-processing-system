@@ -130,7 +130,7 @@ func smoke(ctx context.Context, o options) bool {
 	})
 
 	run("errors map to HTTP status codes", func() error {
-		if c, _, _, _ := createOrder(o.base, "prod-lamp-009", 100000); c != http.StatusConflict {
+		if c, _, _, _ := createOrder(o.base, "prod-lamp-009", 1_000_000_000); c != http.StatusConflict {
 			return fmt.Errorf("insufficient stock: %d, want 409", c)
 		}
 		if c, _, _, _ := call(http.MethodPost, o.base+"/orders", "", map[string]any{"customer_email": "nope", "items": []any{}}); c != http.StatusBadRequest {

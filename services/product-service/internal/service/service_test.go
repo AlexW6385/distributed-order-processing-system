@@ -101,6 +101,9 @@ func (g *fakeGate) Admit(ctx context.Context, productID, orderID, customer strin
 	return true, nil
 }
 func (g *fakeGate) Undo(ctx context.Context, productID, orderID, customer string, qty int32) error {
+	if ctx.Err() != nil {
+		return ctx.Err() // like Redis, a cancelled context fails the call
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.admitted[orderID] {
@@ -186,5 +189,21 @@ func TestFlashSaleGateOutageFallsBackToDatabase(t *testing.T) {
 	svc := New(repo, nil, gate)
 	if _, _, err := svc.ReserveStock(context.Background(), "o1", "c", []domain.ReservationLine{{ProductID: "hot", Quantity: 1}}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Regression: when the request's deadline passed mid-reservation, the units
+// were returned with the cancelled request context, the call failed, and the
+// sale undersold.
+func TestFlashSaleReturnsUnitsWhenRequestIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	repo, gate := &fakeRepo{reserveFn: func() error { cancel(); return context.Canceled }}, &fakeGate{}
+	svc := New(repo, nil, gate)
+	_ = svc.StartFlashSale(context.Background(), "hot", 1)
+	if _, _, err := svc.ReserveStock(ctx, "o1", "c", []domain.ReservationLine{{ProductID: "hot", Quantity: 1}}); err == nil {
+		t.Fatal("expected the cancelled reservation to fail")
+	}
+	if gate.tokens != 1 {
+		t.Fatalf("tokens = %d, want 1 (unit returned)", gate.tokens)
 	}
 }

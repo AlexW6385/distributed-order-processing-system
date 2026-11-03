@@ -92,9 +92,20 @@ Both consumers commit a Kafka offset only after the message has been handled. Tr
 
 Each service has its own database (`products`, `orders`, `payments`, `notifications`). Locally they share one Postgres server. No service reads another's tables, and there are no cross-service joins or transactions. Each service embeds its migrations and applies them at startup under a Postgres advisory lock, so replicas can start together.
 
+## Product catalog cache
+
+`ListProducts` uses cache-aside in Redis with a short TTL (`PRODUCT_CACHE_TTL`, default 5s).
+
+- On a miss, concurrent callers share one database read (`singleflight`), so an expired key does not stampede Postgres.
+- Every reservation or release invalidates the key.
+- A reader that loaded old rows just before a write can still put them back, so the TTL bounds how stale the cache can get.
+- If Redis is down, the service falls back to Postgres.
+
+Cached stock is only for display: reservations always check stock in Postgres under a row lock. That is why serving a slightly stale catalog is acceptable.
+
 ## Timeouts, load balancing and tracing
 
-- Every gRPC client call gets a deadline: 2s per hop inside order-service, 5s at the gateway for the whole saga step.
+- Every gRPC client call gets a deadline: 2s per hop inside order-service, 5s at the gateway for the whole saga step. The per-hop timeout applies even when the caller already sent a deadline; the earlier of the two wins. Without that rule a slow payment call would use the gateway's whole budget, and the client would get a 504 instead of `202 payment_pending`. The load test caught exactly this.
 - Clients dial `dns:///service:port` with round-robin load balancing, so scaled replicas share load.
 - The gateway assigns an `X-Request-ID`. gRPC metadata carries it through every hop, and every access log line includes it.
 

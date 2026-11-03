@@ -9,6 +9,7 @@ An order checkout system built as five Go services. It handles stock reservation
 - **Unknown outcomes are handled.** When a payment call times out, the order waits in `payment_pending` and a recovery worker retries until it gets a definite answer. Unpaid reservations expire.
 - **Database per service**, with migrations embedded and applied at startup.
 - **Deadlines on every gRPC call**, client-side round-robin load balancing, request-ID propagation, and a Redis-backed rate limiter at the gateway.
+- **Redis catalog cache** (cache-aside) with singleflight to stop cache stampedes, plus invalidation whenever stock changes.
 
 ## Architecture
 
@@ -35,7 +36,7 @@ Client ───────────▶ api-gateway ── Redis (rate limit
 | --- | --- | --- |
 | `api-gateway` | HTTP API, rate limiting, request IDs | order, product (gRPC) |
 | `order-service` | order state machine, saga, outbox, recovery worker | product, payment (gRPC); Kafka (produce) |
-| `product-service` | catalog, stock, reservations | Kafka (consume `order.events`) |
+| `product-service` | catalog, stock, reservations, catalog cache | Kafka (consume `order.events`); Redis |
 | `payment-service` | payments (simulated provider) | none |
 | `notification-service` | inbox, sent notifications | Kafka (consume `order.events`) |
 
@@ -80,6 +81,14 @@ The full API is in [openapi.yaml](openapi.yaml).
 
 Run `make scale` to start three order-service replicas and two product-service replicas. The outbox publishers and recovery workers coordinate through the database, and the Kafka consumer group splits `order.events` partitions across the product-service replicas.
 
+## Performance
+
+`loadtest/` measures throughput while checking invariants (`make bench-*`; see [docs/benchmarks.md](docs/benchmarks.md)). The results below are from a single 2 vCPU VM that runs every service, the database and the load generator together:
+
+- **~340 paid orders/s at 216 ms p95** with 50 concurrent users (two HTTP requests per order); throughput peaks at ~380 orders/s
+- **zero overselling** with 1,000 simultaneous orders for 100 units
+- with **30% of payments timing out**, all 500 orders settled with **zero double charges**
+
 ## Tests
 
 ```bash
@@ -113,6 +122,7 @@ services/<name>/
   internal/transport      gRPC / Kafka boundaries
   migrations/             schema owned by the service (embedded)
 deploy/postgres/          creates one database per service
+loadtest/                 load tests that also check invariants
 scripts/                  proto generation, smoke tests
 ```
 

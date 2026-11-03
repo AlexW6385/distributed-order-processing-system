@@ -73,11 +73,33 @@ jobs:
           docker compose config -q
           POSTGRES_USER=ci POSTGRES_PASSWORD=ci docker compose -f docker-compose.yml -f docker-compose.prod.yml config -q
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
       - name: Start stack
+        env:
+          RATE_LIMIT_PER_MINUTE: "0"
         run: docker compose up -d --build --wait --wait-timeout 180
 
       - name: Smoke tests
         run: ./scripts/smoke.sh
+
+      - name: Load test - no overselling
+        run: go run ./loadtest oversell -orders 1000 -units 100
+
+      - name: Load test - checkout throughput
+        run: go run ./loadtest checkout -c 50 -d 20s
+
+      - name: Load test - payment timeouts
+        env:
+          RATE_LIMIT_PER_MINUTE: "0"
+          PAYMENT_FAULT_RATE: "0.3"
+        run: |
+          docker compose up -d --wait payment-service
+          sleep 3
+          go run ./loadtest faults -orders 300 -c 30
 
       - name: Service logs
         if: failure()

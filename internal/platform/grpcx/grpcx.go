@@ -18,7 +18,7 @@ import (
 const requestIDKey = "x-request-id"
 
 // Dial creates a client connection whose calls carry the caller's request ID
-// and get defaultTimeout as a deadline when the caller did not set one.
+// and never wait longer than defaultTimeout.
 // Every remote call needs a deadline; without one a slow dependency holds the
 // caller's goroutines and connections forever.
 //
@@ -34,7 +34,12 @@ func Dial(addr string, defaultTimeout time.Duration) (*grpc.ClientConn, error) {
 
 func clientInterceptor(defaultTimeout time.Duration) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-		if _, ok := ctx.Deadline(); !ok && defaultTimeout > 0 {
+		// Apply the per-hop timeout even when the caller already has a
+		// deadline: WithTimeout keeps whichever is earlier. Otherwise a 5s
+		// gateway deadline would flow through unchanged and a slow payment
+		// call would use up the whole budget, leaving no time to answer
+		// "outcome unknown" before the client gives up.
+		if defaultTimeout > 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
 			defer cancel()

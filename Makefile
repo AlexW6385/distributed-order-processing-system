@@ -1,7 +1,7 @@
 COMPOSE=docker compose
 COMPOSE_PROD=docker compose -f docker-compose.yml -f docker-compose.prod.yml
 
-.PHONY: proto tidy test test-integration up down reset logs ps scale prod-up prod-down
+.PHONY: proto tidy test test-integration up up-bench down reset logs ps scale prod-up prod-down bench-checkout bench-oversell bench-faults
 
 proto:
 	./scripts/generate-proto.sh
@@ -18,6 +18,20 @@ test-integration:
 
 up:
 	$(COMPOSE) up -d --build
+
+# Stack for load tests: rate limiting off, some payments answer too late.
+up-bench:
+	RATE_LIMIT_PER_MINUTE=0 PAYMENT_FAULT_RATE=$${PAYMENT_FAULT_RATE:-0} $(COMPOSE) up -d --build
+
+bench-checkout:
+	go run ./loadtest checkout -c $${C:-50} -d $${D:-60s}
+
+bench-oversell:
+	go run ./loadtest oversell -orders 1000 -units 100
+
+# Needs `PAYMENT_FAULT_RATE=0.3 make up-bench` first.
+bench-faults:
+	go run ./loadtest faults -orders 500 -c 50
 
 down:
 	$(COMPOSE) down

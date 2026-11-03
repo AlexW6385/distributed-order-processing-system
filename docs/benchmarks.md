@@ -1,56 +1,77 @@
-# Benchmarks
+# Benchmarks and test results
 
-`loadtest/` drives the public API and checks invariants while it does. Every number below can be reproduced with the `make bench-*` targets.
+Every number here comes from `loadtest/` and can be reproduced. Absolute throughput depends on the machine, so the useful results are the invariants (which must hold anywhere) and before/after comparisons made on the same machine.
 
-```bash
-make up-bench                      # rate limiting off
-make bench-oversell                # 1,000 concurrent orders for 100 units
-C=50 D=60s make bench-checkout     # closed-loop create + pay
-PAYMENT_FAULT_RATE=0.3 make up-bench && make bench-faults
-```
+## Invariants under load and faults
 
-## Results
+These run in CI on every push, against the full system deployed to a kind cluster. Each scenario ends with `loadtest verify` (see [design.md §10](design.md#10-invariants-and-tests)).
 
-### Docker Compose on a CI runner
+One run on a GitHub-hosted runner (4 vCPU): a single-node kind cluster holding two replicas of each stateless service, Postgres, Kafka, Redis, Toxiproxy, Jaeger and Prometheus, with every request traced, plus the load generator.
 
-GitHub Actions `ubuntu-latest` (4 vCPU, 16 GB). The full Compose stack runs with real Kafka, and the load generator is on the same host. This comes from the `end-to-end` job, which runs on every push.
+| Scenario | Condition | Result |
+| --- | --- | --- |
+| `oversell` | 1,000 simultaneous orders for 100 units | exactly 100 accepted, stock 0, nothing leaked |
+| `flashsale` | 3,000 buyers for 100 units behind the Redis gate | exactly 100 sold, nothing oversold |
+| `checkout` | 50 shoppers, create + pay, 30 s | 158 paid orders/s, checkout p95 458 ms, 0 errors; event publish lag p95 179 ms |
+| `chaos` | payment +3 s latency, product connection resets, payment link down, mixed pay/cancel/refund | 30 unknown outcomes and 5,290 fast `503`s during the faults; settled 2 s after load stopped; all invariants hold over 22,530 orders |
+| pod kills | order-service and product-service pods deleted mid-load | all invariants hold over 28,458 orders |
+| `faults` | 30% of charges commit but answer after the 2 s deadline | 91 of 300 unknown; all settled by recovery in 9.6 s; 300 paid orders, 300 payments, **zero double charges** |
+| reconciler | CronJob over every order | 36,875 orders, 14,501 payments, zero mismatches |
 
-| Scenario | Result |
-| --- | --- |
-| Checkout, 50 virtual users, 20 s | **608 paid orders/s**, checkout p50 80 ms / **p95 111 ms** / p99 132 ms, 0 errors |
-| 1,000 concurrent orders for 100 units | 100 accepted, final stock 0, all answered within 0.8 s |
-| 300 payments with 30% injected timeouts | 96 answered `202`, all settled within 10 s, zero double charges |
+## Same-machine comparisons
 
-### Single small VM
+A 2 vCPU VM running every service, Postgres, Redis, an in-memory Kafka and the load generator. Each pair was measured back to back.
 
-Environment: one 2 vCPU / 7 GB Linux VM. The load generator, all five services, Postgres 16 and Redis share those two cores, so these numbers are a floor rather than a ceiling. Kafka was replaced by an in-memory Kafka-protocol broker for this run. Events are published asynchronously by the outbox, so the broker is not on the checkout path.
+### Flash sale: Redis admission gate vs row lock only
 
-#### Checkout throughput
+5,000 buyers released at once for 100 units of one product.
 
-Each virtual user loops: create an order with one item, then pay it. One paid order is two HTTP requests and five gRPC calls.
+| | Row lock only | Redis gate |
+| --- | --- | --- |
+| Throughput | 803 req/s | 1,100 req/s (+37%) |
+| p95 latency | 5.9 s | 4.4 s (−25%) |
+| Transactions in product database | 9,567 | 4,148 (−57%) |
+| Requests that reached the product row lock | 5,000 | 100 |
+| Units sold | 100 | 100 |
 
-| Virtual users | Paid orders/s | Checkout p50 | Checkout p95 | Checkout p99 | Errors |
-| --- | --- | --- | --- | --- | --- |
-| 10 | 272 | 35 ms | 60 ms | 78 ms | 0 |
-| 50 | 342 | 142 ms | 216 ms | 259 ms | 0 |
-| 200 | 381 | 506 ms | 716 ms | 814 ms | 0 |
+The remaining transactions are tombstones: every rejected order still emits `order.failed`, and product-service records it.
 
-Throughput levels off at around 380 orders/s once the CPU is saturated; beyond that, more users only add queueing latency. In every run the outbox drained within 0.5 s after the load stopped.
+### Outbox relay
 
-#### No overselling
+50 shoppers for 20 s, about 300 paid orders per second.
 
-1,000 single-unit orders for a product with 100 units in stock, all released at the same instant:
+| | Original relay (poll every 2 s, 20 per batch, one Kafka write each) | Batched relay (`SKIP LOCKED`, drains full batches immediately) |
+| --- | --- | --- |
+| Backlog 60 s after load stopped | 9,220 events | 0 (drained in 0.2 s) |
+| Publish lag p50 / p95 | grows without bound (capped at ~10 events/s) | 73 ms / 152 ms |
 
-- 100 accepted, 900 rejected with 409
-- final stock 0, reserved 100, with no leaked or negative stock
-- all responses within 1.4 s; requests for the hot row queue on its lock
+### Circuit breaker during a payment outage
 
-#### Unknown payment outcomes
+Chaos run, same workload, before and after treating breaker rejections as "not sent".
 
-500 orders were paid while payment-service committed 30% of charges but answered after the caller's 2 s deadline:
+| | Breaker rejection treated as unknown | Treated as not sent (order reverts, client retries) |
+| --- | --- | --- |
+| Orders stuck in `payment_pending` 150 s after the faults ended | 10,429 | 0 |
+| Pay responses during the outage | 12,179 × `202` | 8,544 × `503`, 29 × `202` |
 
-- 365 answered 200 and 135 answered 202 `payment_pending`; none hit a gateway timeout
-- the recovery worker settled all 135 within 9 s
-- 500 paid orders, 500 payments, zero double charges
+### Catalog cache
 
-An earlier version of this test found a bug. The gateway's 5 s deadline was propagated to order-service unchanged, so the 2 s per-hop timeout on the payment call never took effect. The client got a 504 instead of a 202. Per-hop timeouts now always apply, capped by the caller's deadline.
+50 users reading `GET /products` for 20 s.
+
+| | Cache off | Cache on |
+| --- | --- | --- |
+| Throughput | 4,783 req/s | 5,451 req/s (+14%) |
+| p95 latency | 19.6 ms | 16.7 ms |
+| Queries reaching Postgres | 95,666 | 5 |
+
+### Partial indexes for the recovery worker and outbox
+
+2,000,000 orders and 2,000,000 outbox events, almost all finished (`loadtest indexes`).
+
+| Query | No index | Partial index |
+| --- | --- | --- |
+| Stuck payments | 98 ms | 0.05 ms |
+| Expired reservations | 95 ms | 0.17 ms |
+| Outbox claim | 103 ms | 0.14 ms |
+
+Each partial index is 16 kB; a full index on the same columns is 13–14 MB.

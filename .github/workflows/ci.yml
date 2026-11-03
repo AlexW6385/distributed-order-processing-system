@@ -93,7 +93,7 @@ jobs:
 
       - name: Port-forward
         run: |
-          for svc in api-gateway:8080 postgres:5432 toxiproxy:8474 prometheus:9090 jaeger:16686 redis:6379; do
+          for svc in api-gateway:8080 postgres:5432 toxiproxy:8474 jaeger:16686 redis:6379; do
             kubectl -n $NS port-forward svc/${svc%%:*} ${svc##*:}:${svc##*:} >/tmp/pf-${svc%%:*}.log 2>&1 &
           done
           sleep 5
@@ -148,12 +148,11 @@ jobs:
 
       - name: Metrics and traces are collected
         run: |
-          for svc in prometheus:9090 jaeger:16686; do
-            pkill -f "port-forward svc/${svc%%:*}" || true
-            kubectl -n $NS port-forward svc/${svc%%:*} ${svc##*:}:${svc##*:} >/tmp/pf-${svc%%:*}.log 2>&1 &
-          done
+          pkill -f "port-forward svc/jaeger" || true
+          kubectl -n $NS port-forward svc/jaeger 16686:16686 >/tmp/pf-jaeger.log 2>&1 &
+          kubectl -n $NS port-forward svc/prometheus 19090:9090 >/tmp/pf-prometheus.log 2>&1 &
           sleep 5
-          q() { curl -s --get localhost:9090/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[0].value[1] // "0"' | cut -d. -f1; }
+          q() { curl -s --get localhost:19090/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[0].value[1] // "0"' | cut -d. -f1; }
           for attempt in $(seq 1 12); do
             targets=$(q 'count(up{job="order-system"} == 1)')
             transitions=$(q 'sum(order_transitions_total)')
@@ -169,6 +168,9 @@ jobs:
             fi
             sleep 5
           done
+          cat /tmp/pf-prometheus.log
+          curl -s localhost:19090/api/v1/targets | jq -c '.data.activeTargets[] | {scrapeUrl, health, lastError}' | head -20
+          kubectl -n $NS logs deployment/prometheus --tail=30
           exit 1
 
       - name: Diagnostics

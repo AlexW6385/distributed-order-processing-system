@@ -6,14 +6,17 @@ Every number here comes from `loadtest/` and can be reproduced. Absolute through
 
 These run in CI on every push, against the full system deployed to a kind cluster. Each scenario ends with `loadtest verify` (see [design.md §10](design.md#10-invariants-and-tests)).
 
+One run on a GitHub-hosted runner (4 vCPU): a single-node kind cluster holding two replicas of each stateless service, Postgres, Kafka, Redis, Toxiproxy, Jaeger and Prometheus, with every request traced, plus the load generator.
+
 | Scenario | Condition | Result |
 | --- | --- | --- |
 | `oversell` | 1,000 simultaneous orders for 100 units | exactly 100 accepted, stock 0, nothing leaked |
 | `flashsale` | 3,000 buyers for 100 units behind the Redis gate | exactly 100 sold, nothing oversold |
-| `faults` | 30% of charges commit but answer after the 2 s deadline | every unknown outcome settled by recovery, **zero double charges** |
-| `chaos` | payment +3 s latency, product connection resets, payment link down, during a mixed pay/cancel/refund workload | all invariants hold after recovery |
-| pod kills | order-service and product-service pods deleted mid-load | all invariants hold |
-| reconciler | CronJob over every order | zero mismatches |
+| `checkout` | 50 shoppers, create + pay, 30 s | 158 paid orders/s, checkout p95 458 ms, 0 errors; event publish lag p95 179 ms |
+| `chaos` | payment +3 s latency, product connection resets, payment link down, mixed pay/cancel/refund | 30 unknown outcomes and 5,290 fast `503`s during the faults; settled 2 s after load stopped; all invariants hold over 22,530 orders |
+| pod kills | order-service and product-service pods deleted mid-load | all invariants hold over 28,458 orders |
+| `faults` | 30% of charges commit but answer after the 2 s deadline | 91 of 300 unknown; all settled by recovery in 9.6 s; 300 paid orders, 300 payments, **zero double charges** |
+| reconciler | CronJob over every order | 28,758 orders, 13,626 payments, zero mismatches |
 
 ## Same-machine comparisons
 

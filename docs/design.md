@@ -73,9 +73,12 @@ A refund is the saga run in reverse for a paid order: `paid → refund_pending`,
 State change and event commit in one transaction. A relay publishes them:
 
 ```sql
-SELECT ... FROM outbox_events
+SELECT ... FROM outbox_events e
 WHERE status = 'pending' AND next_attempt_at <= now()
-ORDER BY created_at LIMIT 100
+  AND NOT EXISTS (SELECT 1 FROM outbox_events earlier            -- keep per-order order
+                  WHERE earlier.aggregate_id = e.aggregate_id
+                    AND earlier.status = 'pending' AND earlier.seq < e.seq)
+ORDER BY seq LIMIT 100
 FOR UPDATE SKIP LOCKED
 ```
 

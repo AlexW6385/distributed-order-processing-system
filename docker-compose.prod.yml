@@ -1,107 +1,19 @@
+# Production overrides: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# Only the gateway is reachable from outside; infrastructure ports are not published.
 services:
   postgres:
-    image: postgres:16-alpine
+    ports: !reset []
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./services/product-service/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_product.sql:ro
-      - ./services/order-service/migrations/001_init.sql:/docker-entrypoint-initdb.d/002_order.sql:ro
-      - ./services/payment-service/migrations/001_init.sql:/docker-entrypoint-initdb.d/003_payment.sql:ro
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     restart: unless-stopped
-
   redis:
-    image: redis:7-alpine
+    ports: !reset []
     restart: unless-stopped
-
   kafka:
-    image: apache/kafka:3.7.0
+    ports: !reset []
     environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     restart: unless-stopped
-
-  product-service:
-    build:
-      context: .
-      dockerfile: services/product-service/Dockerfile
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      PRODUCT_GRPC_PORT: 50052
-    depends_on:
-      - postgres
-    restart: unless-stopped
-
-  payment-service:
-    build:
-      context: .
-      dockerfile: services/payment-service/Dockerfile
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_ADDR: ${REDIS_ADDR}
-      PAYMENT_GRPC_PORT: 50053
-    depends_on:
-      - postgres
-      - redis
-    restart: unless-stopped
-
-  order-service:
-    build:
-      context: .
-      dockerfile: services/order-service/Dockerfile
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      KAFKA_BROKERS: ${KAFKA_BROKERS}
-      ORDER_PAID_TOPIC: ${ORDER_PAID_TOPIC}
-      PRODUCT_GRPC_ADDR: product-service:50052
-      PAYMENT_GRPC_ADDR: payment-service:50053
-      ORDER_GRPC_PORT: 50051
-    depends_on:
-      - postgres
-      - kafka
-      - product-service
-      - payment-service
-    restart: unless-stopped
-
-  notification-service:
-    build:
-      context: .
-      dockerfile: services/notification-service/Dockerfile
-    environment:
-      KAFKA_BROKERS: ${KAFKA_BROKERS}
-      ORDER_PAID_TOPIC: ${ORDER_PAID_TOPIC}
-      NOTIFICATION_GROUP_ID: notification-service
-    depends_on:
-      - kafka
-    restart: unless-stopped
-
-  api-gateway:
-    build:
-      context: .
-      dockerfile: services/api-gateway/Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      API_GATEWAY_PORT: 8080
-      ORDER_GRPC_ADDR: order-service:50051
-      PRODUCT_GRPC_ADDR: product-service:50052
-    depends_on:
-      - order-service
-      - product-service
-    restart: unless-stopped
-
-volumes:
-  postgres_data:

@@ -5,9 +5,26 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  PROTOC_VERSION: "29.3"
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orders
+          POSTGRES_PASSWORD: orders
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orders"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -16,13 +33,13 @@ jobs:
           go-version: "1.23"
           cache: true
 
-      - name: Install protobuf compiler
-        env:
-          PROTOC_VERSION: "29.3"
+      # The generated files record the protoc version, so CI must use the same
+      # one as `make proto` does locally.
+      - name: Install protoc
         run: |
-          curl -sSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-          sudo unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
-          protoc --version
+          curl -sSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
 
       - name: Install protobuf Go plugins
         run: |
@@ -30,16 +47,38 @@ jobs:
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
 
       - name: Check formatting
-        run: |
-          test -z "$(gofmt -l $(find . -path './.git' -prune -o -name '*.go' -print))"
+        run: test -z "$(gofmt -l .)"
 
       - name: Verify generated protobuf files
         run: |
           make proto
           git diff --exit-code -- proto gen
 
-      - name: Run tests
-        run: go test ./...
+      - name: Vet
+        run: go vet ./...
 
-      - name: Validate Docker Compose config
-        run: docker compose config >/tmp/docker-compose-config.yml
+      - name: Test (unit + integration)
+        env:
+          TEST_DATABASE_URL: postgres://orders:orders@localhost:5432/postgres?sslmode=disable
+        run: go test -race -count=1 ./...
+
+  end-to-end:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose files
+        run: |
+          docker compose config -q
+          POSTGRES_USER=ci POSTGRES_PASSWORD=ci docker compose -f docker-compose.yml -f docker-compose.prod.yml config -q
+
+      - name: Start stack
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Smoke tests
+        run: ./scripts/smoke.sh
+
+      - name: Service logs
+        if: failure()
+        run: docker compose logs --no-color

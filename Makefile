@@ -1,7 +1,7 @@
-COMPOSE_DEV=docker compose
-COMPOSE_PROD=docker compose -f docker-compose.prod.yml
+COMPOSE=docker compose
+COMPOSE_PROD=docker compose -f docker-compose.yml -f docker-compose.prod.yml
 
-.PHONY: proto tidy test up down reset logs ps prod-up prod-down
+.PHONY: proto tidy test test-integration up down reset logs ps scale prod-up prod-down
 
 proto:
 	./scripts/generate-proto.sh
@@ -12,20 +12,28 @@ tidy:
 test:
 	go test ./...
 
+# Needs a Postgres the tests can create databases in, e.g. `make up` first.
+test-integration:
+	TEST_DATABASE_URL=postgres://orders:orders@localhost:5432/postgres?sslmode=disable go test -race ./...
+
 up:
-	$(COMPOSE_DEV) up -d
+	$(COMPOSE) up -d --build
 
 down:
-	$(COMPOSE_DEV) down
+	$(COMPOSE) down
 
 reset:
-	$(COMPOSE_DEV) down -v
+	$(COMPOSE) down -v
 
 logs:
-	$(COMPOSE_DEV) logs -f
+	$(COMPOSE) logs -f
 
 ps:
-	$(COMPOSE_DEV) ps
+	$(COMPOSE) ps
+
+# Run several replicas of the stateless services.
+scale:
+	$(COMPOSE) up -d --build --scale order-service=3 --scale product-service=2
 
 prod-up:
 	$(COMPOSE_PROD) up -d --build

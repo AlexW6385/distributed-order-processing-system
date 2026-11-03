@@ -1,27 +1,28 @@
+x-service: &service
+  build:
+    context: .
+  restart: unless-stopped
+
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: distributed-order-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-orders}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orders}
-      POSTGRES_DB: ${POSTGRES_DB:-orders}
+      POSTGRES_DB: postgres
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./services/product-service/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_product.sql:ro
-      - ./services/order-service/migrations/001_init.sql:/docker-entrypoint-initdb.d/002_order.sql:ro
-      - ./services/payment-service/migrations/001_init.sql:/docker-entrypoint-initdb.d/003_payment.sql:ro
+      - ./deploy/postgres/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orders} -d ${POSTGRES_DB:-orders}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orders}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   redis:
     image: redis:7-alpine
-    container_name: distributed-order-redis
     ports:
       - "6379:6379"
     healthcheck:
@@ -32,7 +33,6 @@ services:
 
   kafka:
     image: apache/kafka:3.7.0
-    container_name: distributed-order-kafka
     ports:
       - "9094:9094"
     environment:
@@ -48,7 +48,8 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Services create the topics they need with explicit partition counts.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
       interval: 10s
@@ -56,83 +57,68 @@ services:
       retries: 12
 
   product-service:
-    build:
-      context: .
-      dockerfile: services/product-service/Dockerfile
-    container_name: distributed-order-product-service
+    <<: *service
+    build: { context: ., args: { SERVICE: product-service } }
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgres://orders:orders@postgres:5432/orders?sslmode=disable}
+      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/products?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
       PRODUCT_GRPC_PORT: 50052
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
 
   payment-service:
-    build:
-      context: .
-      dockerfile: services/payment-service/Dockerfile
-    container_name: distributed-order-payment-service
+    <<: *service
+    build: { context: ., args: { SERVICE: payment-service } }
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgres://orders:orders@postgres:5432/orders?sslmode=disable}
-      REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/payments?sslmode=disable
       PAYMENT_GRPC_PORT: 50053
+      PAYMENT_DECLINE_ABOVE_CENTS: ${PAYMENT_DECLINE_ABOVE_CENTS:-100000}
+      PAYMENT_FAULT_RATE: ${PAYMENT_FAULT_RATE:-0}
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
 
   order-service:
-    build:
-      context: .
-      dockerfile: services/order-service/Dockerfile
-    container_name: distributed-order-order-service
+    <<: *service
+    build: { context: ., args: { SERVICE: order-service } }
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgres://orders:orders@postgres:5432/orders?sslmode=disable}
-      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
-      ORDER_PAID_TOPIC: ${ORDER_PAID_TOPIC:-order.paid}
-      PRODUCT_GRPC_ADDR: ${PRODUCT_GRPC_ADDR:-product-service:50052}
-      PAYMENT_GRPC_ADDR: ${PAYMENT_GRPC_ADDR:-payment-service:50053}
+      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/orders?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      PRODUCT_GRPC_ADDR: dns:///product-service:50052
+      PAYMENT_GRPC_ADDR: dns:///payment-service:50053
       ORDER_GRPC_PORT: 50051
+      ORDER_PAYMENT_WINDOW: ${ORDER_PAYMENT_WINDOW:-15m}
     depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      product-service:
-        condition: service_started
-      payment-service:
-        condition: service_started
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      product-service: { condition: service_started }
+      payment-service: { condition: service_started }
 
   notification-service:
-    build:
-      context: .
-      dockerfile: services/notification-service/Dockerfile
-    container_name: distributed-order-notification-service
+    <<: *service
+    build: { context: ., args: { SERVICE: notification-service } }
     environment:
-      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
-      ORDER_PAID_TOPIC: ${ORDER_PAID_TOPIC:-order.paid}
-      NOTIFICATION_GROUP_ID: notification-service
+      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/notifications?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
     depends_on:
-      kafka:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
 
   api-gateway:
-    build:
-      context: .
-      dockerfile: services/api-gateway/Dockerfile
-    container_name: distributed-order-api-gateway
+    <<: *service
+    build: { context: ., args: { SERVICE: api-gateway } }
     ports:
       - "8080:8080"
     environment:
       API_GATEWAY_PORT: 8080
-      ORDER_GRPC_ADDR: ${ORDER_GRPC_ADDR:-order-service:50051}
-      PRODUCT_GRPC_ADDR: ${PRODUCT_GRPC_ADDR:-product-service:50052}
+      ORDER_GRPC_ADDR: dns:///order-service:50051
+      PRODUCT_GRPC_ADDR: dns:///product-service:50052
+      REDIS_ADDR: redis:6379
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-600}
     depends_on:
-      order-service:
-        condition: service_started
-      product-service:
-        condition: service_started
+      order-service: { condition: service_started }
+      product-service: { condition: service_started }
+      redis: { condition: service_healthy }
 
 volumes:
   postgres_data:

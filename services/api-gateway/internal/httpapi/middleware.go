@@ -2,43 +2,44 @@ package httpapi
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/requestid"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// RequestID assigns every request a correlation ID (or keeps the client's
-// X-Request-ID) and puts it in the context so gRPC calls carry it downstream.
-func RequestID() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		id := c.GetHeader("X-Request-ID")
-		if id == "" {
-			id = uuid.NewString()
-		}
-		c.Header("X-Request-ID", id)
-		c.Request = c.Request.WithContext(requestid.With(c.Request.Context(), id))
-		c.Next()
-	}
-}
+var (
+	httpDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "HTTP request latency, by route, method and status.",
+		Buckets: prometheus.ExponentialBuckets(0.001, 2, 14),
+	}, []string{"route", "method", "status"})
+	rateLimited = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "http_rate_limited_total",
+		Help: "Requests rejected by the rate limiter.",
+	})
+)
 
-// AccessLog logs one JSON line per request.
-func AccessLog(log *logging.Logger) gin.HandlerFunc {
+// Observe records RED metrics per route and returns the trace ID in the
+// X-Trace-Id header so a client can look the request up in Jaeger.
+func Observe() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
+		if sc := trace.SpanContextFromContext(c.Request.Context()); sc.HasTraceID() {
+			c.Header("X-Trace-Id", sc.TraceID().String())
+		}
 		c.Next()
-		log.Info("http request", map[string]any{
-			"method":      c.Request.Method,
-			"path":        c.FullPath(),
-			"status":      c.Writer.Status(),
-			"duration_ms": time.Since(start).Milliseconds(),
-			"request_id":  requestid.From(c.Request.Context()),
-		})
+		route := c.FullPath()
+		if route == "" {
+			route = "unmatched"
+		}
+		httpDuration.WithLabelValues(route, c.Request.Method, strconv.Itoa(c.Writer.Status())).Observe(time.Since(start).Seconds())
 	}
 }
 
@@ -54,7 +55,7 @@ return n
 // RateLimit allows limit requests per client IP per window. The counter lives
 // in Redis, so every gateway replica enforces one shared limit. If Redis is
 // unreachable the limiter fails open: availability over strictness.
-func RateLimit(rdb *redis.Client, limit int, window time.Duration, log *logging.Logger) gin.HandlerFunc {
+func RateLimit(rdb *redis.Client, limit int, window time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if limit <= 0 {
 			c.Next()
@@ -64,17 +65,14 @@ func RateLimit(rdb *redis.Client, limit int, window time.Duration, log *logging.
 		key := fmt.Sprintf("ratelimit:%s:%d", c.ClientIP(), bucket)
 		n, err := fixedWindow.Run(c.Request.Context(), rdb, []string{key}, window.Milliseconds()).Int()
 		if err != nil {
-			log.Error("rate limiter unavailable, allowing request", err, nil)
+			slog.WarnContext(c.Request.Context(), "rate limiter unavailable, allowing request", "error", err)
 			c.Next()
 			return
 		}
-		remaining := limit - n
-		if remaining < 0 {
-			remaining = 0
-		}
 		c.Header("X-RateLimit-Limit", strconv.Itoa(limit))
-		c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
+		c.Header("X-RateLimit-Remaining", strconv.Itoa(max(limit-n, 0)))
 		if n > limit {
+			rateLimited.Inc()
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
 			return
 		}

@@ -5,23 +5,35 @@ package inbox
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/AlexW6385/distributed-order-processing-system/internal/contracts/events"
 	platformkafka "github.com/AlexW6385/distributed-order-processing-system/internal/platform/kafka"
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/segmentio/kafka-go"
 )
 
+var (
+	sent = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "notifications_sent_total",
+		Help: "Notifications sent, by event type.",
+	}, []string{"event_type"})
+	duplicates = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "notifications_duplicate_events_total",
+		Help: "Redelivered events skipped by the inbox.",
+	})
+)
+
 type Inbox struct {
-	db  *pgxpool.Pool
-	log *logging.Logger
+	db *pgxpool.Pool
 }
 
-func New(db *pgxpool.Pool, log *logging.Logger) *Inbox {
-	return &Inbox{db: db, log: log}
+func New(db *pgxpool.Pool) *Inbox {
+	return &Inbox{db: db}
 }
 
 // Handler records the event ID and writes the notification in one
@@ -49,7 +61,7 @@ func (in *Inbox) Handler() platformkafka.Handler {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			in.log.Info("duplicate event skipped", map[string]any{"event_id": event.EventID})
+			duplicates.Inc()
 			return nil
 		}
 		if _, err := tx.Exec(ctx, `
@@ -61,7 +73,8 @@ func (in *Inbox) Handler() platformkafka.Handler {
 		if err := tx.Commit(ctx); err != nil {
 			return err
 		}
-		in.log.Info("notification sent", map[string]any{"order_id": event.OrderID, "type": event.EventType, "to": event.CustomerEmail})
+		sent.WithLabelValues(event.EventType).Inc()
+		slog.InfoContext(ctx, "notification sent", "order_id", event.OrderID, "type", event.EventType)
 		return nil
 	}
 }
@@ -77,6 +90,8 @@ func render(e events.OrderEvent) (subject, body string, ok bool) {
 		return "Order expired", fmt.Sprintf("Order %s expired before payment and its items were released.", e.OrderID), true
 	case events.OrderCancelled:
 		return "Order cancelled", fmt.Sprintf("Order %s was cancelled.", e.OrderID), true
+	case events.OrderRefunded:
+		return "Refund issued", fmt.Sprintf("We refunded %s for order %s.", amount, e.OrderID), true
 	}
 	return "", "", false
 }

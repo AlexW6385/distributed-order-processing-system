@@ -3,13 +3,12 @@ package grpcx
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/requestid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -24,7 +23,7 @@ func deadlineSeen(t *testing.T, parent context.Context, hop time.Duration) time.
 		left = time.Until(d)
 		return nil
 	}
-	if err := clientInterceptor(hop)(parent, "/m", nil, nil, nil, invoker); err != nil {
+	if err := deadline(hop)(parent, "/m", nil, nil, nil, invoker); err != nil {
 		t.Fatal(err)
 	}
 	return left
@@ -46,20 +45,6 @@ func TestEarlierParentDeadlineWins(t *testing.T) {
 	}
 }
 
-func TestRequestIDIsPropagated(t *testing.T) {
-	var got []string
-	invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
-		md, _ := metadata.FromOutgoingContext(ctx)
-		got = md.Get(requestIDKey)
-		return nil
-	}
-	ctx := requestid.With(context.Background(), "req-1")
-	_ = clientInterceptor(time.Second)(ctx, "/m", nil, nil, nil, invoker)
-	if len(got) != 1 || got[0] != "req-1" {
-		t.Fatalf("metadata request id = %v", got)
-	}
-}
-
 func TestIsUncertain(t *testing.T) {
 	for code, want := range map[codes.Code]bool{
 		codes.DeadlineExceeded: true, codes.Unavailable: true, codes.Internal: true,
@@ -71,5 +56,57 @@ func TestIsUncertain(t *testing.T) {
 	}
 	if !IsUncertain(errors.New("connection reset")) {
 		t.Error("a non-status error must be treated as uncertain")
+	}
+}
+
+func TestBreakerOpensAndRecovers(t *testing.T) {
+	b := NewBreaker("test", 3, 50*time.Millisecond)
+	call := b.interceptor()
+	fail := func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error {
+		return status.Error(codes.Unavailable, "down")
+	}
+	ok := func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error { return nil }
+	definite := func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error {
+		return status.Error(codes.FailedPrecondition, "no stock")
+	}
+
+	// Definite errors prove the dependency is up and never trip the breaker.
+	for i := 0; i < 10; i++ {
+		_ = call(context.Background(), "/m", nil, nil, nil, definite)
+	}
+	for i := 0; i < 3; i++ {
+		_ = call(context.Background(), "/m", nil, nil, nil, fail)
+	}
+	if err := call(context.Background(), "/m", nil, nil, nil, ok); err != ErrBreakerOpen {
+		t.Fatalf("after 3 failures: err = %v, want breaker open", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	// Half-open: one probe; it fails, so the breaker opens again.
+	if err := call(context.Background(), "/m", nil, nil, nil, fail); status.Code(err) != codes.Unavailable || err == ErrBreakerOpen {
+		t.Fatalf("probe should reach the server, got %v", err)
+	}
+	if err := call(context.Background(), "/m", nil, nil, nil, ok); err != ErrBreakerOpen {
+		t.Fatalf("failed probe should reopen the breaker, got %v", err)
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if err := call(context.Background(), "/m", nil, nil, nil, ok); err != nil {
+		t.Fatalf("successful probe: %v", err)
+	}
+	if err := call(context.Background(), "/m", nil, nil, nil, ok); err != nil {
+		t.Fatalf("breaker should be closed after a good probe: %v", err)
+	}
+}
+
+func TestServiceConfigRetriesOnlyListedMethods(t *testing.T) {
+	cfg := serviceConfig([]string{"/payment.v1.PaymentService/Charge"})
+	for _, want := range []string{`"service":"payment.v1.PaymentService"`, `"method":"Charge"`, `"UNAVAILABLE"`, `"retryThrottling"`, `"round_robin"`} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("service config %s lacks %s", cfg, want)
+		}
+	}
+	if strings.Contains(serviceConfig(nil), "retryPolicy") {
+		t.Error("no retry policy expected without retry methods")
 	}
 }

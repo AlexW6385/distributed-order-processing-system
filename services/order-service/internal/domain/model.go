@@ -7,7 +7,7 @@ import (
 
 // Order lifecycle:
 //
-//	pending ──reserve ok──▶ stock_reserved ──pay──▶ payment_pending ──succeeded──▶ paid
+//	pending ──reserve ok──▶ stock_reserved ──pay──▶ payment_pending ──succeeded──▶ paid ──refund──▶ refund_pending ──▶ refunded
 //	   │                         │   │                     │
 //	   └─reserve failed/timeout─▶ failed ◀────declined──────┘
 //	                             │   └─deadline passed──▶ expired
@@ -23,6 +23,8 @@ const (
 	StatusFailed         = "failed"
 	StatusExpired        = "expired"
 	StatusCancelled      = "cancelled"
+	StatusRefundPending  = "refund_pending"
+	StatusRefunded       = "refunded"
 )
 
 var (
@@ -37,12 +39,16 @@ var (
 	// ErrUnavailable means a dependency call failed in a way that leaves its
 	// outcome unknown; the operation may or may not have happened.
 	ErrUnavailable = errors.New("dependency unavailable")
+	// ErrNotSent means the call was refused locally (circuit breaker open):
+	// the dependency is down, but certainly did not act on the request.
+	ErrNotSent = errors.New("dependency unavailable, request not sent")
 )
 
-// IsTerminal reports whether no further transitions are possible.
+// IsTerminal reports whether the order has settled. A paid order is settled
+// but can still be refunded.
 func IsTerminal(status string) bool {
 	switch status {
-	case StatusPaid, StatusFailed, StatusExpired, StatusCancelled:
+	case StatusPaid, StatusFailed, StatusExpired, StatusCancelled, StatusRefunded:
 		return true
 	}
 	return false
@@ -79,7 +85,9 @@ type OutboxEvent struct {
 	AggregateID string
 	EventType   string
 	Payload     []byte
+	TraceParent string
 	Attempts    int
+	CreatedAt   time.Time
 }
 
 // PaymentResult is the definite outcome of a charge.

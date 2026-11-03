@@ -22,11 +22,17 @@ const (
 	OrderFailed    = "order.failed"
 	OrderExpired   = "order.expired"
 	OrderCancelled = "order.cancelled"
+	OrderRefunded  = "order.refunded"
 )
 
-// HeaderEventType is the Kafka header that repeats the event type so consumers
-// can route without decoding the payload.
-const HeaderEventType = "event_type"
+// Kafka headers set on every message: the event type (so consumers can route
+// without decoding), the event ID, and the W3C trace context of the request
+// that caused the event.
+const (
+	HeaderEventType   = "event_type"
+	HeaderEventID     = "event_id"
+	HeaderTraceParent = "traceparent"
+)
 
 // OrderEvent is the payload of every message on Topic.
 type OrderEvent struct {

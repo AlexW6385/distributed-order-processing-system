@@ -48,7 +48,7 @@ func (r *Repository) ListProducts(ctx context.Context) ([]domain.Product, error)
 // rows are then locked with SELECT ... FOR UPDATE in product-ID order; taking
 // locks in one global order means two orders for overlapping products cannot
 // deadlock each other.
-func (r *Repository) ReserveStock(ctx context.Context, orderID string, lines []domain.ReservationLine) ([]domain.ReservedItem, int64, error) {
+func (r *Repository) ReserveStock(ctx context.Context, orderID, customer string, lines []domain.ReservationLine) ([]domain.ReservedItem, int64, error) {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return nil, 0, err
@@ -56,8 +56,8 @@ func (r *Repository) ReserveStock(ctx context.Context, orderID string, lines []d
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO reservations (order_id, status) VALUES ($1, 'reserved')
-		ON CONFLICT (order_id) DO NOTHING`, orderID)
+		INSERT INTO reservations (order_id, status, customer_email) VALUES ($1, 'reserved', $2)
+		ON CONFLICT (order_id) DO NOTHING`, orderID, customer)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -127,11 +127,12 @@ func (r *Repository) ReserveStock(ctx context.Context, orderID string, lines []d
 
 // Release returns an order's reserved stock. It is idempotent. Releasing an
 // order that has no reservation yet records a tombstone so a delayed
-// ReserveStock for that order is rejected instead of leaking stock.
-func (r *Repository) Release(ctx context.Context, orderID string) error {
+// ReserveStock for that order is rejected instead of leaking stock. It
+// returns the items it put back (none on a repeat) and the customer.
+func (r *Repository) Release(ctx context.Context, orderID string) ([]domain.ReservedItem, string, error) {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
@@ -139,45 +140,67 @@ func (r *Repository) Release(ctx context.Context, orderID string) error {
 		INSERT INTO reservations (order_id, status) VALUES ($1, 'released')
 		ON CONFLICT (order_id) DO NOTHING`, orderID)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
 	if tag.RowsAffected() == 1 {
-		return tx.Commit(ctx) // tombstone
+		return nil, "", tx.Commit(ctx) // tombstone
 	}
+	return r.restore(ctx, tx, orderID, domain.ReservationReserved)
+}
 
-	var status string
-	if err := tx.QueryRow(ctx, `SELECT status FROM reservations WHERE order_id = $1 FOR UPDATE`, orderID).Scan(&status); err != nil {
-		return err
+// Restock returns the stock of a refunded order: confirmed -> released. It is
+// idempotent.
+func (r *Repository) Restock(ctx context.Context, orderID string) ([]domain.ReservedItem, string, error) {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, "", err
 	}
-	switch status {
-	case domain.ReservationReleased:
-		return nil
-	case domain.ReservationConfirmed:
-		return fmt.Errorf("%w: release of confirmed order %s", domain.ErrInconsistent, orderID)
-	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	return r.restore(ctx, tx, orderID, domain.ReservationConfirmed)
+}
 
-	// Lock products in the same global order as ReserveStock, then restore.
-	if _, err := tx.Exec(ctx, `
-		SELECT p.id FROM products p
-		JOIN reservation_items ri ON ri.product_id = p.id AND ri.order_id = $1
-		ORDER BY p.id
-		FOR UPDATE OF p`, orderID); err != nil {
-		return err
+// restore moves a reservation from `from` to released and adds its items back
+// to stock, locking products in the same global order as ReserveStock.
+func (r *Repository) restore(ctx context.Context, tx pgx.Tx, orderID, from string) ([]domain.ReservedItem, string, error) {
+	var status, customer string
+	err := tx.QueryRow(ctx, `SELECT status, customer_email FROM reservations WHERE order_id = $1 FOR UPDATE`, orderID).Scan(&status, &customer)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", fmt.Errorf("%w: no reservation for order %s", domain.ErrInconsistent, orderID)
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE products p
-		SET stock = p.stock + ri.quantity, updated_at = now()
-		FROM (
-			SELECT product_id, quantity FROM reservation_items
-			WHERE order_id = $1 ORDER BY product_id
-		) ri
-		WHERE p.id = ri.product_id`, orderID); err != nil {
-		return err
+	if err != nil {
+		return nil, "", err
+	}
+	if status == domain.ReservationReleased {
+		return nil, customer, nil
+	}
+	if status != from {
+		return nil, "", fmt.Errorf("%w: cannot release %s order %s", domain.ErrInconsistent, status, orderID)
+	}
+	items, _, err := reservedItems(ctx, tx, orderID)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, item := range items { // reservedItems is ordered by product_id
+		if _, err := tx.Exec(ctx, `UPDATE products SET stock = stock + $1, updated_at = now() WHERE id = $2`, item.Quantity, item.ProductID); err != nil {
+			return nil, "", err
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE reservations SET status = 'released', updated_at = now() WHERE order_id = $1`, orderID); err != nil {
+		return nil, "", err
+	}
+	return items, customer, tx.Commit(ctx)
+}
+
+// SetStock sets a product's available stock (used to open a flash sale).
+func (r *Repository) SetStock(ctx context.Context, productID string, stock int32) error {
+	tag, err := r.db.Exec(ctx, `UPDATE products SET stock = $2, updated_at = now() WHERE id = $1`, productID, stock)
+	if err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: product %s", domain.ErrNotFound, productID)
+	}
+	return nil
 }
 
 // Confirm marks a reservation as consumed by a paid order. It is idempotent.

@@ -19,8 +19,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ProductService_ListProducts_FullMethodName = "/product.v1.ProductService/ListProducts"
-	ProductService_ReserveStock_FullMethodName = "/product.v1.ProductService/ReserveStock"
+	ProductService_ListProducts_FullMethodName   = "/product.v1.ProductService/ListProducts"
+	ProductService_ReserveStock_FullMethodName   = "/product.v1.ProductService/ReserveStock"
+	ProductService_StartFlashSale_FullMethodName = "/product.v1.ProductService/StartFlashSale"
 )
 
 // ProductServiceClient is the client API for ProductService service.
@@ -34,6 +35,10 @@ type ProductServiceClient interface {
 	// ReserveStock is idempotent per order_id. It fails with FailedPrecondition
 	// if stock is insufficient or the order's reservation was already released.
 	ReserveStock(ctx context.Context, in *ReserveStockRequest, opts ...grpc.CallOption) (*ReserveStockResponse, error)
+	// StartFlashSale sets a product's stock and puts it behind the Redis
+	// admission gate: one unit per customer, and requests beyond the stock are
+	// rejected in Redis without touching Postgres.
+	StartFlashSale(ctx context.Context, in *StartFlashSaleRequest, opts ...grpc.CallOption) (*StartFlashSaleResponse, error)
 }
 
 type productServiceClient struct {
@@ -64,6 +69,16 @@ func (c *productServiceClient) ReserveStock(ctx context.Context, in *ReserveStoc
 	return out, nil
 }
 
+func (c *productServiceClient) StartFlashSale(ctx context.Context, in *StartFlashSaleRequest, opts ...grpc.CallOption) (*StartFlashSaleResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartFlashSaleResponse)
+	err := c.cc.Invoke(ctx, ProductService_StartFlashSale_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ProductServiceServer is the server API for ProductService service.
 // All implementations must embed UnimplementedProductServiceServer
 // for forward compatibility.
@@ -75,6 +90,10 @@ type ProductServiceServer interface {
 	// ReserveStock is idempotent per order_id. It fails with FailedPrecondition
 	// if stock is insufficient or the order's reservation was already released.
 	ReserveStock(context.Context, *ReserveStockRequest) (*ReserveStockResponse, error)
+	// StartFlashSale sets a product's stock and puts it behind the Redis
+	// admission gate: one unit per customer, and requests beyond the stock are
+	// rejected in Redis without touching Postgres.
+	StartFlashSale(context.Context, *StartFlashSaleRequest) (*StartFlashSaleResponse, error)
 	mustEmbedUnimplementedProductServiceServer()
 }
 
@@ -90,6 +109,9 @@ func (UnimplementedProductServiceServer) ListProducts(context.Context, *ListProd
 }
 func (UnimplementedProductServiceServer) ReserveStock(context.Context, *ReserveStockRequest) (*ReserveStockResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReserveStock not implemented")
+}
+func (UnimplementedProductServiceServer) StartFlashSale(context.Context, *StartFlashSaleRequest) (*StartFlashSaleResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method StartFlashSale not implemented")
 }
 func (UnimplementedProductServiceServer) mustEmbedUnimplementedProductServiceServer() {}
 func (UnimplementedProductServiceServer) testEmbeddedByValue()                        {}
@@ -148,6 +170,24 @@ func _ProductService_ReserveStock_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ProductService_StartFlashSale_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartFlashSaleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ProductServiceServer).StartFlashSale(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ProductService_StartFlashSale_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ProductServiceServer).StartFlashSale(ctx, req.(*StartFlashSaleRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ProductService_ServiceDesc is the grpc.ServiceDesc for ProductService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -162,6 +202,10 @@ var ProductService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReserveStock",
 			Handler:    _ProductService_ReserveStock_Handler,
+		},
+		{
+			MethodName: "StartFlashSale",
+			Handler:    _ProductService_StartFlashSale_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -7,7 +7,6 @@ import (
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/app"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/config"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/grpcx"
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/repository"
 	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/service"
 	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/transport/grpcapi"
@@ -15,11 +14,10 @@ import (
 )
 
 func main() {
-	ctx, stop := app.SignalContext()
-	defer stop()
-	log := logging.New("payment-service")
+	ctx, done := app.Start("payment-service")
+	defer done()
 
-	db := app.OpenDB(ctx, log, config.String("DATABASE_URL", "postgres://orders:orders@localhost:5432/payments?sslmode=disable"), migrations.FS)
+	db := app.OpenDB(ctx, config.String("DATABASE_URL", "postgres://orders:orders@localhost:5432/payments?sslmode=disable"), migrations.FS)
 	defer db.Close()
 
 	svc := service.New(repository.New(db), service.Config{
@@ -28,7 +26,7 @@ func main() {
 		FaultDelay:        config.Duration("PAYMENT_FAULT_DELAY", 5*time.Second),
 	})
 
-	server := grpcx.NewServer(log)
+	server, health := grpcx.NewServer()
 	paymentv1.RegisterPaymentServiceServer(server, grpcapi.New(svc))
-	app.ServeGRPC(ctx, log, server, config.String("PAYMENT_GRPC_PORT", "50053"))
+	app.ServeGRPC(ctx, server, health, config.String("PAYMENT_GRPC_PORT", "50053"))
 }

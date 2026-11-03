@@ -11,6 +11,10 @@ service ProductService {
   // ReserveStock is idempotent per order_id. It fails with FailedPrecondition
   // if stock is insufficient or the order's reservation was already released.
   rpc ReserveStock(ReserveStockRequest) returns (ReserveStockResponse);
+  // StartFlashSale sets a product's stock and puts it behind the Redis
+  // admission gate: one unit per customer, and requests beyond the stock are
+  // rejected in Redis without touching Postgres.
+  rpc StartFlashSale(StartFlashSaleRequest) returns (StartFlashSaleResponse);
 }
 
 message Product {
@@ -43,9 +47,21 @@ message ReservedItem {
 message ReserveStockRequest {
   string order_id = 1;
   repeated ReservationLine items = 2;
+  // customer_email enforces per-customer limits in flash sales.
+  string customer_email = 3;
 }
 
 message ReserveStockResponse {
   repeated ReservedItem items = 1;
   int64 total_cents = 2;
+}
+
+message StartFlashSaleRequest {
+  string product_id = 1;
+  int32 stock = 2;
+}
+
+message StartFlashSaleResponse {
+  string product_id = 1;
+  int32 stock = 2;
 }

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/AlexW6385/distributed-order-processing-system/internal/contracts/events"
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/testdb"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/domain"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/recovery"
@@ -27,7 +26,7 @@ type fakeProduct struct {
 	err   error
 }
 
-func (f *fakeProduct) ReserveStock(ctx context.Context, orderID string, items []domain.ItemInput) ([]domain.Item, int64, error) {
+func (f *fakeProduct) ReserveStock(ctx context.Context, orderID, customer string, items []domain.ItemInput) ([]domain.Item, int64, error) {
 	f.calls.Add(1)
 	if f.err != nil {
 		return nil, 0, f.err
@@ -46,15 +45,34 @@ func (f *fakeProduct) ReserveStock(ctx context.Context, orderID string, items []
 type fakePayment struct {
 	mu        sync.Mutex
 	charged   map[string]domain.PaymentResult
+	refunded  map[string]bool
+	refunds   atomic.Int32
 	calls     atomic.Int32
 	decline   bool
 	lose      atomic.Bool // record the charge but report an unknown outcome
+	notSent   atomic.Bool // circuit breaker open: refuse without recording
 	slowStart chan struct{}
 }
 
-func newFakePayment() *fakePayment { return &fakePayment{charged: map[string]domain.PaymentResult{}} }
+func newFakePayment() *fakePayment {
+	return &fakePayment{charged: map[string]domain.PaymentResult{}, refunded: map[string]bool{}}
+}
+
+func (f *fakePayment) Refund(ctx context.Context, orderID string, amount int64) error {
+	f.refunds.Add(1)
+	f.mu.Lock()
+	f.refunded[orderID] = true // idempotent per order, like payment-service
+	f.mu.Unlock()
+	if f.lose.Load() {
+		return fmt.Errorf("%w: deadline exceeded", domain.ErrUnavailable)
+	}
+	return nil
+}
 
 func (f *fakePayment) Charge(ctx context.Context, orderID string, amount int64, key string) (domain.PaymentResult, error) {
+	if f.notSent.Load() {
+		return domain.PaymentResult{}, fmt.Errorf("%w: circuit breaker open", domain.ErrNotSent)
+	}
 	f.calls.Add(1)
 	if f.slowStart != nil {
 		<-f.slowStart
@@ -85,7 +103,7 @@ type harness struct {
 func newHarness(t *testing.T, window time.Duration) *harness {
 	db := testdb.New(t, migrations.FS)
 	h := &harness{db: db, repo: repository.New(db), product: &fakeProduct{}, payment: newFakePayment()}
-	h.svc = service.New(h.repo, h.product, h.payment, service.Config{PaymentWindow: window}, logging.New("test"))
+	h.svc = service.New(h.repo, h.product, h.payment, service.Config{PaymentWindow: window})
 	return h
 }
 
@@ -118,7 +136,7 @@ func (h *harness) events(t *testing.T, orderID string) []string {
 }
 
 func (h *harness) recovery(pending, retry time.Duration) *recovery.Worker {
-	return recovery.New(h.repo, h.svc, recovery.Config{PendingTimeout: pending, PaymentRetryAfter: retry}, logging.New("test"))
+	return recovery.New(h.repo, h.svc, recovery.Config{PendingTimeout: pending, PaymentRetryAfter: retry})
 }
 
 func assertEvents(t *testing.T, got []string, want ...string) {
@@ -390,5 +408,132 @@ func TestValidation(t *testing.T) {
 	}
 	if _, err := h.svc.GetOrder(context.Background(), "does-not-exist"); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("unknown order: err = %v, want ErrNotFound", err)
+	}
+}
+
+func (h *harness) paid(t *testing.T) *domain.Order {
+	t.Helper()
+	order := h.create(t)
+	paid, err := h.svc.PayOrder(context.Background(), order.ID, "key-"+order.ID)
+	if err != nil || paid.Status != domain.StatusPaid {
+		t.Fatalf("pay: %v %v", paid, err)
+	}
+	return paid
+}
+
+func TestRefund(t *testing.T) {
+	h := newHarness(t, time.Minute)
+	order := h.paid(t)
+	refunded, err := h.svc.RefundOrder(context.Background(), order.ID)
+	if err != nil || refunded.Status != domain.StatusRefunded {
+		t.Fatalf("refund: %v %v", refunded, err)
+	}
+	assertEvents(t, h.events(t, order.ID), events.OrderPaid, events.OrderRefunded)
+	again, err := h.svc.RefundOrder(context.Background(), order.ID)
+	if err != nil || again.Status != domain.StatusRefunded {
+		t.Fatalf("repeat refund should return the refunded order: %v %v", again, err)
+	}
+	if n := h.payment.refunds.Load(); n != 1 {
+		t.Fatalf("payment refund called %d times, want 1", n)
+	}
+}
+
+func TestConcurrentRefundsRefundOnce(t *testing.T) {
+	h := newHarness(t, time.Minute)
+	order := h.paid(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = h.svc.RefundOrder(context.Background(), order.ID) }()
+	}
+	wg.Wait()
+	if n := h.payment.refunds.Load(); n != 1 {
+		t.Fatalf("payment refund called %d times, want 1", n)
+	}
+	assertEvents(t, h.events(t, order.ID), events.OrderPaid, events.OrderRefunded)
+}
+
+func TestUnknownRefundOutcomeIsResolvedByRecovery(t *testing.T) {
+	h := newHarness(t, time.Minute)
+	order := h.paid(t)
+	h.payment.lose.Store(true)
+	pending, err := h.svc.RefundOrder(context.Background(), order.ID)
+	if err != nil || pending.Status != domain.StatusRefundPending {
+		t.Fatalf("refund with unknown outcome: %v %v", pending, err)
+	}
+	h.payment.lose.Store(false)
+	h.recovery(time.Minute, time.Nanosecond).RunOnce(context.Background())
+	final, _ := h.repo.Get(context.Background(), order.ID)
+	if final.Status != domain.StatusRefunded {
+		t.Fatalf("status after recovery = %s, want refunded", final.Status)
+	}
+	assertEvents(t, h.events(t, order.ID), events.OrderPaid, events.OrderRefunded)
+}
+
+func TestOnlyPaidOrdersCanBeRefunded(t *testing.T) {
+	h := newHarness(t, time.Minute)
+	order := h.create(t)
+	if _, err := h.svc.RefundOrder(context.Background(), order.ID); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("refund of reserved order: err = %v, want ErrConflict", err)
+	}
+}
+
+// When the circuit breaker refuses the only charge attempt, nothing can have
+// been charged: the order goes back to stock_reserved and the client retries,
+// rather than leaving work for the recovery worker.
+func TestBreakerOpenOnFirstAttemptLetsClientRetry(t *testing.T) {
+	h := newHarness(t, time.Minute)
+	order := h.create(t)
+	h.payment.notSent.Store(true)
+	if _, err := h.svc.PayOrder(context.Background(), order.ID, "k1"); !errors.Is(err, domain.ErrNotSent) {
+		t.Fatalf("err = %v, want ErrNotSent", err)
+	}
+	if s, _ := h.repo.Get(context.Background(), order.ID); s.Status != domain.StatusStockReserved {
+		t.Fatalf("status = %s, want stock_reserved", s.Status)
+	}
+	h.payment.notSent.Store(false)
+	if paid, err := h.svc.PayOrder(context.Background(), order.ID, "k2"); err != nil || paid.Status != domain.StatusPaid {
+		t.Fatalf("retry: %v %v", paid, err)
+	}
+}
+
+// An order already in payment_pending may have an earlier attempt with an
+// unknown outcome, so a refused retry must leave it there.
+func TestBreakerOpenDuringRecoveryKeepsOrderPending(t *testing.T) {
+	h := newHarness(t, time.Minute)
+	order := h.create(t)
+	h.payment.lose.Store(true)
+	if p, _ := h.svc.PayOrder(context.Background(), order.ID, "k1"); p.Status != domain.StatusPaymentPending {
+		t.Fatalf("status = %s", p.Status)
+	}
+	h.payment.lose.Store(false)
+	h.payment.notSent.Store(true)
+	h.recovery(time.Minute, time.Nanosecond).RunOnce(context.Background())
+	if s, _ := h.repo.Get(context.Background(), order.ID); s.Status != domain.StatusPaymentPending {
+		t.Fatalf("status = %s, want payment_pending", s.Status)
+	}
+	h.payment.notSent.Store(false)
+	h.recovery(time.Minute, time.Nanosecond).RunOnce(context.Background())
+	if s, _ := h.repo.Get(context.Background(), order.ID); s.Status != domain.StatusPaid {
+		t.Fatalf("status = %s, want paid", s.Status)
+	}
+}
+
+func TestRecoveryDrainsLargeBacklog(t *testing.T) {
+	h := newHarness(t, time.Minute)
+	h.payment.lose.Store(true)
+	for i := 0; i < 450; i++ {
+		order := h.create(t)
+		if _, err := h.svc.PayOrder(context.Background(), order.ID, "k"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.payment.lose.Store(false)
+	worker := recovery.New(h.repo, h.svc, recovery.Config{Interval: 5 * time.Second, PendingTimeout: time.Minute, PaymentRetryAfter: time.Nanosecond, BatchSize: 100})
+	worker.RunOnce(context.Background())
+	var pending int
+	_ = h.db.QueryRow(context.Background(), `SELECT count(*) FROM orders WHERE status = 'payment_pending'`).Scan(&pending)
+	if pending != 0 {
+		t.Fatalf("%d orders still payment_pending after one pass", pending)
 	}
 }

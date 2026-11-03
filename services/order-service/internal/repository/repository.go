@@ -8,12 +8,20 @@ import (
 	"time"
 
 	"github.com/AlexW6385/distributed-order-processing-system/internal/contracts/events"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/obs"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/domain"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+var transitions = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "order_transitions_total",
+	Help: "Committed order state transitions, by target status.",
+}, []string{"status"})
 
 type Repository struct {
 	db *pgxpool.Pool
@@ -79,6 +87,14 @@ func (r *Repository) StartPayment(ctx context.Context, orderID, paymentKey strin
 	})
 }
 
+// AbortPayment returns an order to stock_reserved when its only charge
+// attempt was never sent, so the customer can simply try again.
+func (r *Repository) AbortPayment(ctx context.Context, orderID string) (*domain.Order, error) {
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		return transition(ctx, tx, orderID, []string{domain.StatusPaymentPending}, domain.StatusStockReserved, "")
+	})
+}
+
 // MarkPaid records a successful payment and emits order.paid in the same
 // transaction (transactional outbox).
 func (r *Repository) MarkPaid(ctx context.Context, orderID string) (*domain.Order, error) {
@@ -105,6 +121,34 @@ func (r *Repository) Close(ctx context.Context, orderID string, from []string, t
 			return nil, err
 		}
 		return order, insertEvent(ctx, tx, order, eventType, reason)
+	})
+}
+
+// StartRefund claims a paid order for refund; concurrent refunds of the same
+// order cannot both win.
+func (r *Repository) StartRefund(ctx context.Context, orderID string) (*domain.Order, error) {
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		return transition(ctx, tx, orderID, []string{domain.StatusPaid}, domain.StatusRefundPending, "")
+	})
+}
+
+// MarkRefunded records a completed refund and emits order.refunded, which
+// tells product-service to return the stock.
+func (r *Repository) MarkRefunded(ctx context.Context, orderID string) (*domain.Order, error) {
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		order, err := transition(ctx, tx, orderID, []string{domain.StatusRefundPending}, domain.StatusRefunded, "")
+		if err != nil {
+			return nil, err
+		}
+		return order, insertEvent(ctx, tx, order, events.OrderRefunded, "")
+	})
+}
+
+// AbortRefund returns an order to paid when payment-service definitively
+// refused the refund.
+func (r *Repository) AbortRefund(ctx context.Context, orderID, reason string) (*domain.Order, error) {
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		return transition(ctx, tx, orderID, []string{domain.StatusRefundPending}, domain.StatusPaid, `failure_reason = $4`, reason)
 	})
 }
 
@@ -137,10 +181,36 @@ func (r *Repository) PastDeadline(ctx context.Context, limit int) ([]domain.Orde
 		LIMIT $2`, domain.StatusStockReserved, limit)
 }
 
+// ListOrders returns up to limit orders updated after the (updatedAt, id)
+// cursor, oldest first. Keyset pagination stays fast at any depth.
+func (r *Repository) ListOrders(ctx context.Context, afterUpdated time.Time, afterID string, limit int) ([]domain.Order, error) {
+	return r.list(ctx, `
+		SELECT `+orderColumns+` FROM orders
+		WHERE (updated_at, id) > ($1, $2)
+		ORDER BY updated_at, id
+		LIMIT $3`, afterUpdated, afterID, limit)
+}
+
+// OutboxBacklog returns the number of unpublished events and the age of the
+// oldest one.
+func (r *Repository) OutboxBacklog(ctx context.Context) (int, time.Duration, error) {
+	var n int
+	var oldest float64
+	err := r.db.QueryRow(ctx, `
+		SELECT count(*), coalesce(extract(epoch FROM now() - min(created_at)), 0)
+		FROM outbox_events WHERE status = 'pending'`).Scan(&n, &oldest)
+	return n, time.Duration(oldest * float64(time.Second)), err
+}
+
 // ClaimOutbox locks up to limit due events with FOR UPDATE SKIP LOCKED and
 // passes them to publish while the lock is held. Several publisher replicas can
 // run at once: each one skips rows another replica has locked. publish returns
 // the IDs it delivered; the rest are rescheduled with exponential backoff.
+//
+// An event is only claimed once every earlier event of the same order is
+// published. Without that rule, replica A could hold order.paid while replica
+// B skips past it and publishes order.refunded first, and product-service
+// would see the refund before the payment.
 func (r *Repository) ClaimOutbox(ctx context.Context, limit, maxAttempts int, publish func([]domain.OutboxEvent) (delivered map[string]bool, err error)) (int, error) {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -149,10 +219,15 @@ func (r *Repository) ClaimOutbox(ctx context.Context, limit, maxAttempts int, pu
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, aggregate_id, event_type, payload, attempts
-		FROM outbox_events
+		SELECT id, aggregate_id, event_type, payload, trace_parent, attempts, created_at
+		FROM outbox_events e
 		WHERE status = 'pending' AND next_attempt_at <= now()
-		ORDER BY created_at
+		  AND NOT EXISTS (
+		      SELECT 1 FROM outbox_events earlier
+		      WHERE earlier.aggregate_id = e.aggregate_id
+		        AND earlier.status = 'pending'
+		        AND earlier.seq < e.seq)
+		ORDER BY seq
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED`, limit)
 	if err != nil {
@@ -161,7 +236,7 @@ func (r *Repository) ClaimOutbox(ctx context.Context, limit, maxAttempts int, pu
 	var batch []domain.OutboxEvent
 	for rows.Next() {
 		var e domain.OutboxEvent
-		if err := rows.Scan(&e.ID, &e.AggregateID, &e.EventType, &e.Payload, &e.Attempts); err != nil {
+		if err := rows.Scan(&e.ID, &e.AggregateID, &e.EventType, &e.Payload, &e.TraceParent, &e.Attempts, &e.CreatedAt); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -180,13 +255,10 @@ func (r *Repository) ClaimOutbox(ctx context.Context, limit, maxAttempts int, pu
 	if publishErr != nil {
 		lastError = publishErr.Error()
 	}
+	var published []string
 	for _, e := range batch {
 		if delivered[e.ID] {
-			if _, err := tx.Exec(ctx, `
-				UPDATE outbox_events SET status = 'published', published_at = now(), attempts = attempts + 1
-				WHERE id = $1`, e.ID); err != nil {
-				return 0, err
-			}
+			published = append(published, e.ID)
 			continue
 		}
 		backoff := time.Duration(1<<min(e.Attempts, 8)) * time.Second
@@ -200,10 +272,17 @@ func (r *Repository) ClaimOutbox(ctx context.Context, limit, maxAttempts int, pu
 			return 0, err
 		}
 	}
+	if len(published) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE outbox_events SET status = 'published', published_at = now(), attempts = attempts + 1
+			WHERE id = ANY($1)`, published); err != nil {
+			return 0, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}
-	return len(delivered), publishErr
+	return len(published), publishErr
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -260,8 +339,8 @@ func insertEvent(ctx context.Context, tx pgx.Tx, order *domain.Order, eventType,
 		return err
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload)
-		VALUES ($1, 'order', $2, $3, $4)`, event.EventID, order.ID, eventType, payload)
+		INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload, trace_parent)
+		VALUES ($1, 'order', $2, $3, $4, $5)`, event.EventID, order.ID, eventType, payload, obs.TraceParent(ctx))
 	return err
 }
 
@@ -278,6 +357,7 @@ func (r *Repository) inTx(ctx context.Context, fn func(pgx.Tx) (*domain.Order, e
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	transitions.WithLabelValues(order.Status).Inc()
 	if order.Items == nil {
 		if order.Items, err = r.items(ctx, order.ID); err != nil {
 			return nil, err

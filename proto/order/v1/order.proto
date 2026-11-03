@@ -14,6 +14,12 @@ service OrderService {
   rpc PayOrder(PayOrderRequest) returns (OrderResponse);
   // CancelOrder cancels an order that has stock reserved but is not paid.
   rpc CancelOrder(CancelOrderRequest) returns (OrderResponse);
+  // RefundOrder refunds a paid order in full and returns its stock. Like
+  // PayOrder it may answer with status refund_pending and settle later.
+  rpc RefundOrder(RefundOrderRequest) returns (OrderResponse);
+  // ListOrders pages through orders by last update, oldest first. Used by
+  // the reconciler.
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
 }
 
 message OrderItemInput {
@@ -59,6 +65,20 @@ message PayOrderRequest {
 
 message CancelOrderRequest {
   string order_id = 1;
+}
+
+message RefundOrderRequest {
+  string order_id = 1;
+}
+
+message ListOrdersRequest {
+  string page_token = 1;
+  int32 page_size = 2;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+  string next_page_token = 2;
 }
 
 message OrderResponse {

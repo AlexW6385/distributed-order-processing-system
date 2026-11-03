@@ -13,19 +13,44 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/mail"
 	"strings"
 	"time"
 
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/domain"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+var downstreamOutcomes = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "saga_step_outcomes_total",
+	Help: "Outcomes of saga steps against downstream services (ok, rejected, unknown, not_sent).",
+}, []string{"step", "outcome"})
+
+func observe(step string, err error) {
+	switch {
+	case err == nil:
+		downstreamOutcomes.WithLabelValues(step, "ok").Inc()
+	case errors.Is(err, domain.ErrNotSent):
+		downstreamOutcomes.WithLabelValues(step, "not_sent").Inc()
+	case errors.Is(err, domain.ErrUnavailable):
+		downstreamOutcomes.WithLabelValues(step, "unknown").Inc()
+	default:
+		downstreamOutcomes.WithLabelValues(step, "rejected").Inc()
+	}
+}
 
 type Repository interface {
 	CreatePending(ctx context.Context, email, createKey string) (*domain.Order, bool, error)
 	MarkReserved(ctx context.Context, orderID string, items []domain.Item, totalCents int64, expiresAt time.Time) (*domain.Order, error)
 	StartPayment(ctx context.Context, orderID, paymentKey string) (*domain.Order, error)
 	MarkPaid(ctx context.Context, orderID string) (*domain.Order, error)
+	AbortPayment(ctx context.Context, orderID string) (*domain.Order, error)
+	StartRefund(ctx context.Context, orderID string) (*domain.Order, error)
+	MarkRefunded(ctx context.Context, orderID string) (*domain.Order, error)
+	AbortRefund(ctx context.Context, orderID, reason string) (*domain.Order, error)
+	ListOrders(ctx context.Context, afterUpdated time.Time, afterID string, limit int) ([]domain.Order, error)
 	Close(ctx context.Context, orderID string, from []string, to, reason string) (*domain.Order, error)
 	Get(ctx context.Context, orderID string) (*domain.Order, error)
 }
@@ -33,13 +58,14 @@ type Repository interface {
 // ProductClient reserves stock. Errors wrap domain.ErrRejected for a definite
 // refusal and domain.ErrUnavailable when the outcome is unknown.
 type ProductClient interface {
-	ReserveStock(ctx context.Context, orderID string, items []domain.ItemInput) ([]domain.Item, int64, error)
+	ReserveStock(ctx context.Context, orderID, customerEmail string, items []domain.ItemInput) ([]domain.Item, int64, error)
 }
 
 // PaymentClient charges an order. A decline is a result, not an error. Errors
 // wrap domain.ErrUnavailable when the outcome is unknown.
 type PaymentClient interface {
 	Charge(ctx context.Context, orderID string, amountCents int64, idempotencyKey string) (domain.PaymentResult, error)
+	Refund(ctx context.Context, orderID string, amountCents int64) error
 }
 
 type Config struct {
@@ -53,14 +79,13 @@ type Service struct {
 	product ProductClient
 	payment PaymentClient
 	cfg     Config
-	logger  *logging.Logger
 }
 
-func New(repo Repository, product ProductClient, payment PaymentClient, cfg Config, logger *logging.Logger) *Service {
+func New(repo Repository, product ProductClient, payment PaymentClient, cfg Config) *Service {
 	if cfg.PaymentWindow <= 0 {
 		cfg.PaymentWindow = 15 * time.Minute
 	}
-	return &Service{repo: repo, product: product, payment: payment, cfg: cfg, logger: logger}
+	return &Service{repo: repo, product: product, payment: payment, cfg: cfg}
 }
 
 type CreateInput struct {
@@ -91,12 +116,13 @@ func (s *Service) CreateOrder(ctx context.Context, in CreateInput) (*domain.Orde
 		return order, nil
 	}
 
-	reserved, total, err := s.product.ReserveStock(ctx, order.ID, items)
+	reserved, total, err := s.product.ReserveStock(ctx, order.ID, order.CustomerEmail, items)
+	observe("reserve", err)
 	if err != nil {
 		reason := "stock reservation failed: " + err.Error()
 		if _, closeErr := s.repo.Close(ctx, order.ID, []string{domain.StatusPending}, domain.StatusFailed, reason); closeErr != nil {
 			// The recovery worker closes pending orders that stay stuck.
-			s.logger.Error("close order after reservation failure", closeErr, map[string]any{"order_id": order.ID})
+			slog.ErrorContext(ctx, "close order after reservation failure", "order_id", order.ID, "error", closeErr)
 		}
 		return nil, err
 	}
@@ -160,16 +186,31 @@ func (s *Service) PayOrder(ctx context.Context, orderID, idempotencyKey string) 
 	if err != nil {
 		return nil, err
 	}
-	return s.SettlePayment(ctx, order)
+	settled, err := s.SettlePayment(ctx, order)
+	if errors.Is(err, domain.ErrNotSent) {
+		// This was the order's only attempt and it never left this process,
+		// so nothing can have been charged: undo the claim and let the
+		// client retry, instead of queueing work for the recovery worker.
+		if _, abortErr := s.repo.AbortPayment(ctx, order.ID); abortErr != nil {
+			return order, nil // the recovery worker will settle it
+		}
+		return nil, err
+	}
+	return settled, err
 }
 
 // SettlePayment charges an order in payment_pending and records the outcome.
-// It is safe to call repeatedly for the same order.
+// It is safe to call repeatedly for the same order. It returns ErrNotSent,
+// with the order unchanged, when the circuit breaker refused the call.
 func (s *Service) SettlePayment(ctx context.Context, order *domain.Order) (*domain.Order, error) {
 	result, err := s.payment.Charge(ctx, order.ID, order.TotalCents, order.PaymentKey)
+	observe("charge", err)
 	if err != nil {
+		if errors.Is(err, domain.ErrNotSent) {
+			return order, err
+		}
 		if errors.Is(err, domain.ErrUnavailable) {
-			s.logger.Info("payment outcome unknown, will retry", map[string]any{"order_id": order.ID, "error": err.Error()})
+			slog.InfoContext(ctx, "payment outcome unknown, will retry", "order_id", order.ID, "error", err)
 			return order, nil
 		}
 		// A definite error such as an amount mismatch: retrying will not help.
@@ -191,6 +232,67 @@ func (s *Service) closeAfterPayment(ctx context.Context, orderID, reason string)
 		return s.repo.Get(ctx, orderID)
 	}
 	return closed, err
+}
+
+// RefundOrder refunds a paid order in full. The paid -> refund_pending
+// transition makes concurrent refunds safe; payment-service refunds at most
+// once per order, so the recovery worker can retry an unknown outcome.
+func (s *Service) RefundOrder(ctx context.Context, orderID string) (*domain.Order, error) {
+	order, err := s.GetOrder(ctx, orderID)
+	if err != nil {
+		return nil, err
+	}
+	switch order.Status {
+	case domain.StatusRefundPending, domain.StatusRefunded:
+		return order, nil
+	case domain.StatusPaid:
+	default:
+		return nil, fmt.Errorf("%w: order is %s", domain.ErrConflict, order.Status)
+	}
+	order, err = s.repo.StartRefund(ctx, orderID)
+	if errors.Is(err, domain.ErrConflict) {
+		return s.repo.Get(ctx, orderID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	settled, err := s.SettleRefund(ctx, order)
+	if errors.Is(err, domain.ErrNotSent) {
+		if _, abortErr := s.repo.AbortRefund(ctx, order.ID, "payment service unavailable"); abortErr != nil {
+			return order, nil
+		}
+		return nil, err
+	}
+	return settled, err
+}
+
+// SettleRefund refunds an order in refund_pending and records the outcome.
+// It is safe to call repeatedly for the same order.
+func (s *Service) SettleRefund(ctx context.Context, order *domain.Order) (*domain.Order, error) {
+	err := s.payment.Refund(ctx, order.ID, order.TotalCents)
+	observe("refund", err)
+	switch {
+	case errors.Is(err, domain.ErrNotSent):
+		return order, err
+	case errors.Is(err, domain.ErrUnavailable):
+		slog.InfoContext(ctx, "refund outcome unknown, will retry", "order_id", order.ID, "error", err)
+		return order, nil
+	case err != nil:
+		return s.repo.AbortRefund(ctx, order.ID, "refund rejected: "+err.Error())
+	}
+	refunded, err := s.repo.MarkRefunded(ctx, order.ID)
+	if errors.Is(err, domain.ErrConflict) {
+		return s.repo.Get(ctx, order.ID)
+	}
+	return refunded, err
+}
+
+// ListOrders pages through orders for the reconciler.
+func (s *Service) ListOrders(ctx context.Context, afterUpdated time.Time, afterID string, limit int) ([]domain.Order, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+	return s.repo.ListOrders(ctx, afterUpdated, afterID, limit)
 }
 
 // CancelOrder cancels a reserved order that has not started payment.

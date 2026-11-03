@@ -43,7 +43,7 @@ func (s *Server) ReserveStock(ctx context.Context, req *productv1.ReserveStockRe
 	for _, item := range req.Items {
 		lines = append(lines, domain.ReservationLine{ProductID: item.ProductId, Quantity: item.Quantity})
 	}
-	items, total, err := s.service.ReserveStock(ctx, req.OrderId, lines)
+	items, total, err := s.service.ReserveStock(ctx, req.OrderId, req.CustomerEmail, lines)
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -58,6 +58,13 @@ func (s *Server) ReserveStock(ctx context.Context, req *productv1.ReserveStockRe
 		})
 	}
 	return &productv1.ReserveStockResponse{Items: out, TotalCents: total}, nil
+}
+
+func (s *Server) StartFlashSale(ctx context.Context, req *productv1.StartFlashSaleRequest) (*productv1.StartFlashSaleResponse, error) {
+	if err := s.service.StartFlashSale(ctx, req.ProductId, req.Stock); err != nil {
+		return nil, toStatus(err)
+	}
+	return &productv1.StartFlashSaleResponse{ProductId: req.ProductId, Stock: req.Stock}, nil
 }
 
 func toStatus(err error) error {

@@ -19,7 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PaymentService_Charge_FullMethodName = "/payment.v1.PaymentService/Charge"
+	PaymentService_Charge_FullMethodName           = "/payment.v1.PaymentService/Charge"
+	PaymentService_Refund_FullMethodName           = "/payment.v1.PaymentService/Refund"
+	PaymentService_ListPayments_FullMethodName     = "/payment.v1.PaymentService/ListPayments"
+	PaymentService_GetLedgerSummary_FullMethodName = "/payment.v1.PaymentService/GetLedgerSummary"
 )
 
 // PaymentServiceClient is the client API for PaymentService service.
@@ -30,6 +33,13 @@ type PaymentServiceClient interface {
 	// key: calling Charge again for the same order returns the original result,
 	// so callers can retry safely after a timeout.
 	Charge(ctx context.Context, in *ChargeRequest, opts ...grpc.CallOption) (*ChargeResponse, error)
+	// Refund refunds a successful charge in full, at most once per order.
+	Refund(ctx context.Context, in *RefundRequest, opts ...grpc.CallOption) (*RefundResponse, error)
+	// ListPayments pages through payments in creation order. Used by the
+	// reconciler.
+	ListPayments(ctx context.Context, in *ListPaymentsRequest, opts ...grpc.CallOption) (*ListPaymentsResponse, error)
+	// GetLedgerSummary returns account balances from the double-entry ledger.
+	GetLedgerSummary(ctx context.Context, in *GetLedgerSummaryRequest, opts ...grpc.CallOption) (*LedgerSummary, error)
 }
 
 type paymentServiceClient struct {
@@ -50,6 +60,36 @@ func (c *paymentServiceClient) Charge(ctx context.Context, in *ChargeRequest, op
 	return out, nil
 }
 
+func (c *paymentServiceClient) Refund(ctx context.Context, in *RefundRequest, opts ...grpc.CallOption) (*RefundResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RefundResponse)
+	err := c.cc.Invoke(ctx, PaymentService_Refund_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *paymentServiceClient) ListPayments(ctx context.Context, in *ListPaymentsRequest, opts ...grpc.CallOption) (*ListPaymentsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListPaymentsResponse)
+	err := c.cc.Invoke(ctx, PaymentService_ListPayments_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *paymentServiceClient) GetLedgerSummary(ctx context.Context, in *GetLedgerSummaryRequest, opts ...grpc.CallOption) (*LedgerSummary, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LedgerSummary)
+	err := c.cc.Invoke(ctx, PaymentService_GetLedgerSummary_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PaymentServiceServer is the server API for PaymentService service.
 // All implementations must embed UnimplementedPaymentServiceServer
 // for forward compatibility.
@@ -58,6 +98,13 @@ type PaymentServiceServer interface {
 	// key: calling Charge again for the same order returns the original result,
 	// so callers can retry safely after a timeout.
 	Charge(context.Context, *ChargeRequest) (*ChargeResponse, error)
+	// Refund refunds a successful charge in full, at most once per order.
+	Refund(context.Context, *RefundRequest) (*RefundResponse, error)
+	// ListPayments pages through payments in creation order. Used by the
+	// reconciler.
+	ListPayments(context.Context, *ListPaymentsRequest) (*ListPaymentsResponse, error)
+	// GetLedgerSummary returns account balances from the double-entry ledger.
+	GetLedgerSummary(context.Context, *GetLedgerSummaryRequest) (*LedgerSummary, error)
 	mustEmbedUnimplementedPaymentServiceServer()
 }
 
@@ -70,6 +117,15 @@ type UnimplementedPaymentServiceServer struct{}
 
 func (UnimplementedPaymentServiceServer) Charge(context.Context, *ChargeRequest) (*ChargeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Charge not implemented")
+}
+func (UnimplementedPaymentServiceServer) Refund(context.Context, *RefundRequest) (*RefundResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Refund not implemented")
+}
+func (UnimplementedPaymentServiceServer) ListPayments(context.Context, *ListPaymentsRequest) (*ListPaymentsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListPayments not implemented")
+}
+func (UnimplementedPaymentServiceServer) GetLedgerSummary(context.Context, *GetLedgerSummaryRequest) (*LedgerSummary, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetLedgerSummary not implemented")
 }
 func (UnimplementedPaymentServiceServer) mustEmbedUnimplementedPaymentServiceServer() {}
 func (UnimplementedPaymentServiceServer) testEmbeddedByValue()                        {}
@@ -110,6 +166,60 @@ func _PaymentService_Charge_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PaymentService_Refund_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RefundRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PaymentServiceServer).Refund(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PaymentService_Refund_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PaymentServiceServer).Refund(ctx, req.(*RefundRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PaymentService_ListPayments_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListPaymentsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PaymentServiceServer).ListPayments(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PaymentService_ListPayments_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PaymentServiceServer).ListPayments(ctx, req.(*ListPaymentsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PaymentService_GetLedgerSummary_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLedgerSummaryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PaymentServiceServer).GetLedgerSummary(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PaymentService_GetLedgerSummary_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PaymentServiceServer).GetLedgerSummary(ctx, req.(*GetLedgerSummaryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PaymentService_ServiceDesc is the grpc.ServiceDesc for PaymentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -120,6 +230,18 @@ var PaymentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Charge",
 			Handler:    _PaymentService_Charge_Handler,
+		},
+		{
+			MethodName: "Refund",
+			Handler:    _PaymentService_Refund_Handler,
+		},
+		{
+			MethodName: "ListPayments",
+			Handler:    _PaymentService_ListPayments_Handler,
+		},
+		{
+			MethodName: "GetLedgerSummary",
+			Handler:    _PaymentService_GetLedgerSummary_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

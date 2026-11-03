@@ -9,7 +9,6 @@ import (
 
 	"github.com/AlexW6385/distributed-order-processing-system/internal/contracts/events"
 	platformkafka "github.com/AlexW6385/distributed-order-processing-system/internal/platform/kafka"
-	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/testdb"
 	"github.com/AlexW6385/distributed-order-processing-system/services/notification-service/internal/inbox"
 	"github.com/AlexW6385/distributed-order-processing-system/services/notification-service/migrations"
@@ -18,7 +17,7 @@ import (
 
 func TestRedeliveredEventNotifiesOnce(t *testing.T) {
 	db := testdb.New(t, migrations.FS)
-	handle := inbox.New(db, logging.New("test")).Handler()
+	handle := inbox.New(db).Handler()
 
 	payload, _ := json.Marshal(events.OrderEvent{
 		EventID: "evt-1", EventType: events.OrderPaid, OrderID: "order-1",
@@ -38,7 +37,7 @@ func TestRedeliveredEventNotifiesOnce(t *testing.T) {
 
 func TestUndecodableEventIsPermanent(t *testing.T) {
 	db := testdb.New(t, migrations.FS)
-	handle := inbox.New(db, logging.New("test")).Handler()
+	handle := inbox.New(db).Handler()
 	err := handle(context.Background(), kafka.Message{Value: []byte("not json")})
 	if !errors.Is(err, platformkafka.ErrPermanent) {
 		t.Fatalf("err = %v, want ErrPermanent", err)

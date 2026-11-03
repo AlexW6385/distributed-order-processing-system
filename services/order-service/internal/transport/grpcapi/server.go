@@ -3,6 +3,9 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	orderv1 "github.com/AlexW6385/distributed-order-processing-system/gen/order/v1"
@@ -46,6 +49,36 @@ func (s *Server) CancelOrder(ctx context.Context, req *orderv1.CancelOrderReques
 	return respond(s.service.CancelOrder(ctx, req.OrderId))
 }
 
+func (s *Server) RefundOrder(ctx context.Context, req *orderv1.RefundOrderRequest) (*orderv1.OrderResponse, error) {
+	return respond(s.service.RefundOrder(ctx, req.OrderId))
+}
+
+// ListOrders uses an opaque "<unix nanos>|<id>" page token over (updated_at, id).
+func (s *Server) ListOrders(ctx context.Context, req *orderv1.ListOrdersRequest) (*orderv1.ListOrdersResponse, error) {
+	after, afterID := time.Time{}, ""
+	if req.PageToken != "" {
+		nanos, id, ok := strings.Cut(req.PageToken, "|")
+		n, err := strconv.ParseInt(nanos, 10, 64)
+		if !ok || err != nil {
+			return nil, status.Error(codes.InvalidArgument, "bad page token")
+		}
+		after, afterID = time.Unix(0, n), id
+	}
+	orders, err := s.service.ListOrders(ctx, after, afterID, int(req.PageSize))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	resp := &orderv1.ListOrdersResponse{}
+	for i := range orders {
+		resp.Orders = append(resp.Orders, toProto(&orders[i]))
+	}
+	if n := len(orders); n > 0 {
+		last := orders[n-1]
+		resp.NextPageToken = fmt.Sprintf("%d|%s", last.UpdatedAt.UnixNano(), last.ID)
+	}
+	return resp, nil
+}
+
 func respond(order *domain.Order, err error) (*orderv1.OrderResponse, error) {
 	if err != nil {
 		return nil, toStatus(err)
@@ -61,7 +94,7 @@ func toStatus(err error) error {
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrRejected):
 		return status.Error(codes.FailedPrecondition, err.Error())
-	case errors.Is(err, domain.ErrUnavailable):
+	case errors.Is(err, domain.ErrUnavailable), errors.Is(err, domain.ErrNotSent):
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, context.DeadlineExceeded):
 		return status.Error(codes.DeadlineExceeded, err.Error())
@@ -88,8 +121,8 @@ func toProto(order *domain.Order) *orderv1.Order {
 		TotalCents:    order.TotalCents,
 		Items:         items,
 		FailureReason: order.FailureReason,
-		CreatedAt:     order.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:     order.UpdatedAt.UTC().Format(time.RFC3339),
+		CreatedAt:     order.CreatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt:     order.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	if order.ExpiresAt != nil {
 		out.ExpiresAt = order.ExpiresAt.UTC().Format(time.RFC3339)

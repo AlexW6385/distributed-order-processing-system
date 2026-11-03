@@ -14,11 +14,12 @@ import (
 
 type Reservations interface {
 	Release(ctx context.Context, orderID string) error
+	Restock(ctx context.Context, orderID string) error
 	Confirm(ctx context.Context, orderID string) error
 }
 
-// Handler confirms stock for paid orders and releases it for orders that will
-// never be paid. Release and Confirm are idempotent, so redelivered events are
+// Handler confirms stock for paid orders, releases it for orders that will
+// never be paid, and returns it for refunded orders. Release and Confirm are idempotent, so redelivered events are
 // harmless and no separate deduplication table is needed.
 func Handler(res Reservations) platformkafka.Handler {
 	return func(ctx context.Context, msg kafka.Message) error {
@@ -31,6 +32,8 @@ func Handler(res Reservations) platformkafka.Handler {
 			err = res.Confirm(ctx, event.OrderID)
 		case event.ReleasesStock():
 			err = res.Release(ctx, event.OrderID)
+		case event.EventType == events.OrderRefunded:
+			err = res.Restock(ctx, event.OrderID)
 		default:
 			return nil
 		}

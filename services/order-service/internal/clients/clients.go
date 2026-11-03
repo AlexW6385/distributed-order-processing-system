@@ -21,12 +21,12 @@ func NewProductClient(client productv1.ProductServiceClient) *ProductClient {
 	return &ProductClient{client: client}
 }
 
-func (c *ProductClient) ReserveStock(ctx context.Context, orderID string, items []domain.ItemInput) ([]domain.Item, int64, error) {
+func (c *ProductClient) ReserveStock(ctx context.Context, orderID, customerEmail string, items []domain.ItemInput) ([]domain.Item, int64, error) {
 	lines := make([]*productv1.ReservationLine, 0, len(items))
 	for _, item := range items {
 		lines = append(lines, &productv1.ReservationLine{ProductId: item.ProductID, Quantity: item.Quantity})
 	}
-	resp, err := c.client.ReserveStock(ctx, &productv1.ReserveStockRequest{OrderId: orderID, Items: lines})
+	resp, err := c.client.ReserveStock(ctx, &productv1.ReserveStockRequest{OrderId: orderID, Items: lines, CustomerEmail: customerEmail})
 	if err != nil {
 		return nil, 0, translate(err)
 	}
@@ -66,9 +66,20 @@ func (c *PaymentClient) Charge(ctx context.Context, orderID string, amountCents 
 	}, nil
 }
 
+func (c *PaymentClient) Refund(ctx context.Context, orderID string, amountCents int64) error {
+	_, err := c.client.Refund(ctx, &paymentv1.RefundRequest{OrderId: orderID, AmountCents: amountCents})
+	if err != nil {
+		return translate(err)
+	}
+	return nil
+}
+
 // translate separates definite refusals from calls whose outcome is unknown.
 func translate(err error) error {
 	msg := status.Convert(err).Message()
+	if grpcx.IsBreakerOpen(err) {
+		return fmt.Errorf("%w: %s", domain.ErrNotSent, msg)
+	}
 	if grpcx.IsUncertain(err) {
 		return fmt.Errorf("%w: %s", domain.ErrUnavailable, msg)
 	}

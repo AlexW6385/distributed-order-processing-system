@@ -16,6 +16,7 @@ CREATE TABLE products (
 CREATE TABLE reservations (
     order_id TEXT PRIMARY KEY,
     status TEXT NOT NULL CHECK (status IN ('reserved', 'confirmed', 'released')),
+    customer_email TEXT NOT NULL DEFAULT '',
     total_cents BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

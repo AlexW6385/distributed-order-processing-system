@@ -83,9 +83,9 @@ Run `make scale` to start three order-service replicas and two product-service r
 
 ## Performance
 
-`loadtest/` measures throughput while checking invariants (`make bench-*`; see [docs/benchmarks.md](docs/benchmarks.md)). The results below are from a single 2 vCPU VM that runs every service, the database and the load generator together:
+`loadtest/` measures throughput while checking invariants (`make bench-*`; see [docs/benchmarks.md](docs/benchmarks.md)). CI runs it against the full Compose stack, with real Kafka, on a 4 vCPU runner:
 
-- **~340 paid orders/s at 216 ms p95** with 50 concurrent users (two HTTP requests per order); throughput peaks at ~380 orders/s
+- **~600 paid orders/s at 111 ms p95** with 50 concurrent users (two HTTP requests per order)
 - **zero overselling** with 1,000 simultaneous orders for 100 units
 - with **30% of payments timing out**, all 500 orders settled with **zero double charges**
 

@@ -11,9 +11,21 @@ PAYMENT_FAULT_RATE=0.3 make up-bench && make bench-faults
 
 ## Results
 
+### Docker Compose on a CI runner
+
+GitHub Actions `ubuntu-latest` (4 vCPU, 16 GB). The full Compose stack runs with real Kafka, and the load generator is on the same host. This comes from the `end-to-end` job, which runs on every push.
+
+| Scenario | Result |
+| --- | --- |
+| Checkout, 50 virtual users, 20 s | **608 paid orders/s**, checkout p50 80 ms / **p95 111 ms** / p99 132 ms, 0 errors |
+| 1,000 concurrent orders for 100 units | 100 accepted, final stock 0, all answered within 0.8 s |
+| 300 payments with 30% injected timeouts | 96 answered `202`, all settled within 10 s, zero double charges |
+
+### Single small VM
+
 Environment: one 2 vCPU / 7 GB Linux VM. The load generator, all five services, Postgres 16 and Redis share those two cores, so these numbers are a floor rather than a ceiling. Kafka was replaced by an in-memory Kafka-protocol broker for this run. Events are published asynchronously by the outbox, so the broker is not on the checkout path.
 
-### Checkout throughput
+#### Checkout throughput
 
 Each virtual user loops: create an order with one item, then pay it. One paid order is two HTTP requests and five gRPC calls.
 
@@ -25,7 +37,7 @@ Each virtual user loops: create an order with one item, then pay it. One paid or
 
 Throughput levels off at around 380 orders/s once the CPU is saturated; beyond that, more users only add queueing latency. In every run the outbox drained within 0.5 s after the load stopped.
 
-### No overselling
+#### No overselling
 
 1,000 single-unit orders for a product with 100 units in stock, all released at the same instant:
 
@@ -33,7 +45,7 @@ Throughput levels off at around 380 orders/s once the CPU is saturated; beyond t
 - final stock 0, reserved 100, with no leaked or negative stock
 - all responses within 1.4 s; requests for the hot row queue on its lock
 
-### Unknown payment outcomes
+#### Unknown payment outcomes
 
 500 orders were paid while payment-service committed 30% of charges but answered after the caller's 2 s deadline:
 

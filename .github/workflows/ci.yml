@@ -17,7 +17,12 @@ jobs:
           cache: true
 
       - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        env:
+          PROTOC_VERSION: "29.3"
+        run: |
+          curl -sSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          protoc --version
 
       - name: Install protobuf Go plugins
         run: |

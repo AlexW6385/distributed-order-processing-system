@@ -2,6 +2,8 @@ package db
 
 import (
 	"context"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,7 +15,7 @@ func Open(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.MaxConns = 10
+	cfg.MaxConns = int32(maxConns())
 	cfg.MinConns = 1
 	cfg.HealthCheckPeriod = 30 * time.Second
 
@@ -38,4 +40,12 @@ func Open(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	return pool, nil
+}
+
+// maxConns reads DB_MAX_CONNS (default 20): the per-replica connection pool.
+func maxConns() int {
+	if n, err := strconv.Atoi(os.Getenv("DB_MAX_CONNS")); err == nil && n > 0 {
+		return n
+	}
+	return 20
 }

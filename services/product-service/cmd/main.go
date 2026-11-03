@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"time"
 
 	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/contracts/events"
@@ -11,11 +12,13 @@ import (
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/grpcx"
 	platformkafka "github.com/AlexW6385/distributed-order-processing-system/internal/platform/kafka"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
+	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/cache"
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/repository"
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/service"
 	eventsapi "github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/transport/events"
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/transport/grpcapi"
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/migrations"
+	"github.com/go-redis/redis/v8"
 )
 
 func main() {
@@ -25,7 +28,9 @@ func main() {
 
 	db := app.OpenDB(ctx, log, config.String("DATABASE_URL", "postgres://orders:orders@localhost:5432/products?sslmode=disable"), migrations.FS)
 	defer db.Close()
-	svc := service.New(repository.New(db))
+	rdb := redis.NewClient(&redis.Options{Addr: config.String("REDIS_ADDR", "localhost:6379")})
+	defer rdb.Close()
+	svc := service.New(repository.New(db), cache.NewRedis(rdb, config.Duration("PRODUCT_CACHE_TTL", 5*time.Second)), log)
 
 	brokers := config.CSV("KAFKA_BROKERS", "localhost:9094")
 	partitions := config.Int("ORDER_EVENTS_PARTITIONS", 3)

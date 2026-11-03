@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+  labels: {app: product-service}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: product-service}
+  template:
+    metadata:
+      labels: {app: product-service}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      containers:
+        - name: product-service
+          image: order-system:dev
+          command: [product-service]
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: grpc, containerPort: 50052}
+            - {name: metrics, containerPort: 9090}
+          envFrom:
+            - configMapRef: {name: order-system-config}
+          env:
+          - name: DATABASE_URL
+            valueFrom: {secretKeyRef: {name: order-system-db, key: product-service}}
+          readinessProbe:
+            grpc: {port: 50052}
+            periodSeconds: 5
+          livenessProbe:
+            grpc: {port: 50052}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+spec:
+  clusterIP: None   # headless: clients resolve every pod and balance round-robin
+  selector: {app: product-service}
+  ports:
+    - {name: grpc, port: 50052}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: product-service
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: product-service}
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: product-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: product-service}

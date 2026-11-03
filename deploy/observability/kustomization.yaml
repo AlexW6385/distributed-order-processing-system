@@ -1,0 +1,18 @@
+# Prometheus, Grafana and Jaeger for Kubernetes, built from the same config
+# files Docker Compose mounts.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - k8s.yaml
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml=prometheus-k8s.yml
+      - alerts.yml
+  - name: grafana-provisioning
+    files:
+      - grafana/datasources.yml
+      - grafana/dashboards.yml
+  - name: grafana-dashboards
+    files:
+      - grafana/order-system.json

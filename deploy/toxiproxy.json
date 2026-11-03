@@ -1,0 +1,4 @@
+[
+  {"name": "product", "listen": "0.0.0.0:21052", "upstream": "product-service:50052", "enabled": true},
+  {"name": "payment", "listen": "0.0.0.0:21053", "upstream": "payment-service:50053", "enabled": true}
+]

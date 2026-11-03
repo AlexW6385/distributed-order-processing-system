@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  labels: {app: order-service}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: order-service}
+  template:
+    metadata:
+      labels: {app: order-service}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      containers:
+        - name: order-service
+          image: order-system:dev
+          command: [order-service]
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: grpc, containerPort: 50051}
+            - {name: metrics, containerPort: 9090}
+          envFrom:
+            - configMapRef: {name: order-system-config}
+          env:
+          - name: DATABASE_URL
+            valueFrom: {secretKeyRef: {name: order-system-db, key: order-service}}
+          - {name: PRODUCT_GRPC_ADDR, value: "dns:///product-service:50052"}
+          - {name: PAYMENT_GRPC_ADDR, value: "dns:///payment-service:50053"}
+          readinessProbe:
+            grpc: {port: 50051}
+            periodSeconds: 5
+          livenessProbe:
+            grpc: {port: 50051}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  clusterIP: None   # headless: clients resolve every pod and balance round-robin
+  selector: {app: order-service}
+  ports:
+    - {name: grpc, port: 50051}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: order-service}
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: order-service}

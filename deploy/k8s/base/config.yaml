@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-system-config
+data:
+  KAFKA_BROKERS: kafka:9092
+  REDIS_ADDR: redis:6379
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  SHUTDOWN_DELAY: 5s
+  RATE_LIMIT_PER_MINUTE: "600"
+  PAYMENT_DECLINE_ABOVE_CENTS: "100000"
+  PAYMENT_FAULT_RATE: "0"
+---
+# Development credentials. Replace with real secrets outside dev.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: order-system-db
+stringData:
+  order-service: postgres://orders:orders@postgres:5432/orders?sslmode=disable
+  product-service: postgres://orders:orders@postgres:5432/products?sslmode=disable
+  payment-service: postgres://orders:orders@postgres:5432/payments?sslmode=disable
+  notification-service: postgres://orders:orders@postgres:5432/notifications?sslmode=disable

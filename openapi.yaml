@@ -1,7 +1,11 @@
 openapi: 3.0.3
 info:
   title: Distributed Order Processing System API
-  version: 1.0.0
+  version: 2.0.0
+  description: |
+    Public HTTP API served by api-gateway. Every response carries an
+    X-Request-ID header; send your own to correlate logs across services.
+    Requests are rate limited per client IP (429 when exceeded).
 servers:
   - url: http://localhost:8080
 paths:
@@ -13,13 +17,27 @@ paths:
           description: Gateway is running
   /products:
     get:
-      summary: List available products
+      summary: List products and available stock
       responses:
         "200":
           description: Product list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Product"
   /orders:
     post:
-      summary: Create an order and reserve stock
+      summary: Create an order and reserve its stock
+      description: |
+        With an Idempotency-Key, retrying the same request returns the order the
+        first request created instead of creating another one.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyOptional"
       requestBody:
         required: true
         content:
@@ -28,50 +46,114 @@ paths:
               $ref: "#/components/schemas/CreateOrderRequest"
       responses:
         "201":
-          description: Order created
+          description: Order created with stock reserved (or the replayed order)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
         "400":
-          description: Invalid request
+          $ref: "#/components/responses/Error"
+        "409":
+          description: Stock could not be reserved (for example, insufficient stock)
+        "503":
+          description: A dependency was unavailable; the order was failed and can be retried
   /orders/{order_id}:
     get:
-      summary: Get an order by id
+      summary: Get an order
       parameters:
-        - name: order_id
-          in: path
-          required: true
-          schema:
-            type: string
+        - $ref: "#/components/parameters/OrderID"
       responses:
         "200":
           description: Order found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
         "404":
-          description: Order not found
+          $ref: "#/components/responses/Error"
   /orders/{order_id}/pay:
     post:
       summary: Pay a reserved order
+      description: |
+        Safe to retry. Concurrent calls for one order charge it once.
+        Returns 202 with status payment_pending when the payment outcome is not
+        known yet; the order settles in the background, so poll
+        GET /orders/{order_id}.
       parameters:
-        - name: order_id
-          in: path
+        - $ref: "#/components/parameters/OrderID"
+        - name: Idempotency-Key
+          in: header
           required: true
           schema:
             type: string
-        - name: Idempotency-Key
-          in: header
-          required: false
-          schema:
-            type: string
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/PayOrderRequest"
       responses:
         "200":
-          description: Order paid
+          description: Payment settled; status is paid or failed (declined)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "202":
+          description: Payment outcome unknown; status is payment_pending
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
         "400":
-          description: Invalid request
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: Order cannot be paid (cancelled, expired, failed, or past its payment window)
+  /orders/{order_id}/cancel:
+    post:
+      summary: Cancel a reserved order that has not started payment
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+      responses:
+        "200":
+          description: Order cancelled; its stock is released asynchronously
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          description: Order is not in a cancellable state
 components:
+  parameters:
+    OrderID:
+      name: order_id
+      in: path
+      required: true
+      schema:
+        type: string
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
   schemas:
+    Product:
+      type: object
+      properties:
+        id: { type: string, example: prod-coffee-001 }
+        name: { type: string }
+        description: { type: string }
+        price_cents: { type: integer }
+        stock: { type: integer }
     CreateOrderRequest:
       type: object
       required: [customer_email, items]
@@ -81,6 +163,7 @@ components:
           example: alex@example.com
         items:
           type: array
+          minItems: 1
           items:
             type: object
             required: [product_id, quantity]
@@ -92,9 +175,34 @@ components:
                 type: integer
                 minimum: 1
                 example: 2
-    PayOrderRequest:
+    OrderResponse:
       type: object
       properties:
-        idempotency_key:
+        order:
+          $ref: "#/components/schemas/Order"
+    Order:
+      type: object
+      properties:
+        id: { type: string }
+        customer_email: { type: string }
+        status:
           type: string
-          example: checkout-123
+          enum: [pending, stock_reserved, payment_pending, paid, failed, expired, cancelled]
+        total_cents: { type: integer }
+        failure_reason: { type: string }
+        expires_at:
+          type: string
+          format: date-time
+          description: Payment deadline for a reserved order
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              product_id: { type: string }
+              product_name: { type: string }
+              quantity: { type: integer }
+              unit_price_cents: { type: integer }
+              subtotal_cents: { type: integer }

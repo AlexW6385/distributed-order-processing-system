@@ -1,9 +1,15 @@
 // Command loadtest drives the public HTTP API and checks the system's
 // invariants under load.
 //
+//	go run ./loadtest smoke                           # API behaviour, end to end
+//	go run ./loadtest verify                          # cross-service invariants over all data
 //	go run ./loadtest checkout -c 200 -d 60s
 //	go run ./loadtest oversell -orders 1000 -units 100
 //	go run ./loadtest faults   -orders 500            # payment-service needs PAYMENT_FAULT_RATE > 0
+//	go run ./loadtest flashsale -orders 10000 -units 100 [-gate=false]
+//	go run ./loadtest chaos    -c 30 -d 60s           # Toxiproxy faults during load, then verify
+//	go run ./loadtest catalog  -c 50 -d 20s           # product list throughput and database load
+//	go run ./loadtest indexes  -rows 2000000          # query plans with and without the partial indexes
 //
 // The scenarios read service databases to set up fixtures and to verify
 // results; pass their URLs with -products-db, -orders-db and -payments-db
@@ -22,10 +28,13 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/migrate"
+	ordermigrations "github.com/AlexW6385/distributed-order-processing-system/services/order-service/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -39,11 +48,17 @@ type options struct {
 	productsDB  string
 	ordersDB    string
 	paymentsDB  string
+	adminDB     string
+	notifyDB    string
+	redisAddr   string
+	toxiproxy   string
+	gate        bool
+	rows        int
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: loadtest checkout|oversell|faults [flags]")
+		fmt.Fprintln(os.Stderr, "usage: loadtest smoke|checkout|oversell|flashsale|faults|chaos|verify|catalog|indexes [flags]")
 		os.Exit(2)
 	}
 	scenario := os.Args[1]
@@ -59,6 +74,12 @@ func main() {
 	fs.StringVar(&o.productsDB, "products-db", pg+"products?sslmode=disable", "product-service database")
 	fs.StringVar(&o.ordersDB, "orders-db", pg+"orders?sslmode=disable", "order-service database")
 	fs.StringVar(&o.paymentsDB, "payments-db", pg+"payments?sslmode=disable", "payment-service database")
+	fs.StringVar(&o.adminDB, "admin-db", pg+"postgres?sslmode=disable", "database used to create a scratch database (indexes)")
+	fs.IntVar(&o.rows, "rows", 2_000_000, "rows to seed (indexes)")
+	fs.StringVar(&o.notifyDB, "notifications-db", pg+"notifications?sslmode=disable", "notification-service database")
+	fs.StringVar(&o.redisAddr, "redis", "localhost:6379", "Redis (flashsale without the gate)")
+	fs.StringVar(&o.toxiproxy, "toxiproxy", "http://localhost:8474", "Toxiproxy API (chaos)")
+	fs.BoolVar(&o.gate, "gate", true, "use the Redis flash-sale gate (flashsale)")
 	_ = fs.Parse(os.Args[2:])
 
 	ctx := context.Background()
@@ -70,6 +91,18 @@ func main() {
 		ok = oversell(ctx, o)
 	case "faults":
 		ok = faults(ctx, o)
+	case "catalog":
+		ok = catalog(ctx, o)
+	case "smoke":
+		ok = smoke(ctx, o)
+	case "flashsale":
+		ok = flashsale(ctx, o)
+	case "chaos":
+		ok = chaos(ctx, o)
+	case "verify":
+		ok = verify(ctx, o)
+	case "indexes":
+		ok = indexes(ctx, o)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown scenario %q\n", scenario)
 		os.Exit(2)
@@ -121,8 +154,12 @@ func call(method, url, key string, body any) (int, order, time.Duration, error) 
 }
 
 func createOrder(base, productID string, qty int) (int, order, time.Duration, error) {
+	return createOrderFor(base, "load@example.com", productID, qty)
+}
+
+func createOrderFor(base, email, productID string, qty int) (int, order, time.Duration, error) {
 	return call(http.MethodPost, base+"/orders", "", map[string]any{
-		"customer_email": "load@example.com",
+		"customer_email": email,
 		"items":          []map[string]any{{"product_id": productID, "quantity": qty}},
 	})
 }
@@ -231,7 +268,9 @@ func checkout(ctx context.Context, o options) bool {
 		return false
 	}
 	var ids []string
-	rows, _ := products.Query(ctx, `SELECT id FROM products ORDER BY id`)
+	// Skip products on flash sale: the Redis gate limits them to one unit per
+	// customer, which is not what this scenario measures.
+	rows, _ := products.Query(ctx, `SELECT id FROM products WHERE id NOT IN ('prod-headphones-014', 'prod-speaker-015') ORDER BY id`)
 	for rows.Next() {
 		var id string
 		_ = rows.Scan(&id)
@@ -279,11 +318,14 @@ func checkout(ctx context.Context, o options) bool {
 		}()
 	}
 	time.Sleep(o.warmup)
+	var windowStart, windowEnd time.Time
+	_ = orders.QueryRow(ctx, `SELECT now()`).Scan(&windowStart)
 	measuring.Store(true)
 	began := time.Now()
 	time.Sleep(o.duration)
 	measuring.Store(false)
 	elapsed := time.Since(began)
+	_ = orders.QueryRow(ctx, `SELECT now()`).Scan(&windowEnd)
 	close(stop)
 	wg.Wait()
 
@@ -303,6 +345,20 @@ func checkout(ctx context.Context, o options) bool {
 		time.Sleep(200 * time.Millisecond)
 	}
 	fmt.Printf("  outbox drained %.1fs after load stopped (backlog now %d)\n", time.Since(drainStart).Seconds(), backlog)
+
+	// Publish lag: time from the state change committing to the event being
+	// accepted by Kafka, for events created during the measured window.
+	var p50, p95, p99, maxLag float64
+	_ = orders.QueryRow(ctx, `
+		SELECT coalesce(percentile_cont(0.5) WITHIN GROUP (ORDER BY lag), 0),
+		       coalesce(percentile_cont(0.95) WITHIN GROUP (ORDER BY lag), 0),
+		       coalesce(percentile_cont(0.99) WITHIN GROUP (ORDER BY lag), 0),
+		       coalesce(max(lag), 0)
+		FROM (SELECT extract(epoch FROM published_at - created_at) * 1000 AS lag
+		      FROM outbox_events
+		      WHERE created_at BETWEEN $1 AND $2 AND published_at IS NOT NULL) l`,
+		windowStart, windowEnd).Scan(&p50, &p95, &p99, &maxLag)
+	fmt.Printf("  event publish lag: p50 %.0fms, p95 %.0fms, p99 %.0fms, max %.0fms\n", p50, p95, p99, maxLag)
 
 	var ok = true
 	ok = check(rec.codes["create error"]+rec.codes["pay error"] == 0, "no transport errors") && ok
@@ -405,7 +461,14 @@ func faults(ctx context.Context, o options) bool {
 				rec.add("create", code, err, 0)
 				return
 			}
+			// Like a real client, retry 503s: the circuit breaker refused the
+			// call without sending it, so nothing was charged.
 			code, _, d, err := payOrder(o.base, created.ID)
+			for attempt := 0; code == http.StatusServiceUnavailable && attempt < 300; attempt++ {
+				rec.add("pay", code, err, d)
+				time.Sleep(200 * time.Millisecond)
+				code, _, d, err = payOrder(o.base, created.ID)
+			}
 			rec.add("pay", code, err, d)
 			mu.Lock()
 			ids = append(ids, created.ID)
@@ -445,5 +508,139 @@ func faults(ctx context.Context, o options) bool {
 	ok = check(paidOrders == len(ids), "all %d orders paid (%d)", len(ids), paidOrders) && ok
 	ok = check(succeeded == paidOrders, "payments %d = paid orders %d (no charge without a paid order)", succeeded, paidOrders) && ok
 	ok = check(duplicate == 0, "zero double charges") && ok
-	return ok
+	return verify(ctx, o) && ok
+}
+
+// --- scenario: catalog ------------------------------------------------------
+
+// catalog hammers GET /products and reports how many table scans reached
+// Postgres. Run it with and without the cache (PRODUCT_CACHE_TTL=0).
+func catalog(ctx context.Context, o options) bool {
+	products := mustPool(ctx, o.productsDB)
+	defer products.Close()
+	scans := func() int64 {
+		var n int64
+		_ = products.QueryRow(ctx, `SELECT pg_stat_force_next_flush()`).Scan(new(any))
+		_ = products.QueryRow(ctx, `SELECT coalesce(seq_scan, 0) FROM pg_stat_user_tables WHERE relname = 'products'`).Scan(&n)
+		return n
+	}
+	time.Sleep(2 * time.Second) // let earlier activity reach the statistics
+	before := scans()
+
+	fmt.Printf("catalog: %d virtual users for %s\n", o.concurrency, o.duration)
+	rec := newRecorder()
+	var requests atomic.Int64
+	deadline := time.Now().Add(o.duration)
+	var wg sync.WaitGroup
+	for w := 0; w < o.concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				code, _, d, err := call(http.MethodGet, o.base+"/products", "", nil)
+				rec.add("list", code, err, d)
+				requests.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	time.Sleep(11 * time.Second) // backends flush statistics within ~10s of going idle
+	after := scans()
+
+	fmt.Printf("  %d requests = %.0f req/s\n", requests.Load(), float64(requests.Load())/o.duration.Seconds())
+	rec.report()
+	fmt.Printf("  products table scans in Postgres: %d (%.2f per request)\n", after-before, float64(after-before)/float64(requests.Load()))
+	return check(rec.codes["list 200"] == int(requests.Load()), "all requests succeeded")
+}
+
+// --- scenario: indexes ------------------------------------------------------
+
+// indexes seeds a large order-service database and times the recovery and
+// outbox queries with and without their partial indexes.
+func indexes(ctx context.Context, o options) bool {
+	admin := mustPool(ctx, o.adminDB)
+	defer admin.Close()
+	name := fmt.Sprintf("bench_indexes_%d", time.Now().Unix())
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return false
+	}
+	defer admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)") //nolint:errcheck
+	url := strings.Replace(o.adminDB, "/postgres?", "/"+name+"?", 1)
+	db := mustPool(ctx, url)
+	defer db.Close()
+	if err := migrate.Run(ctx, db, ordermigrations.FS); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return false
+	}
+
+	fmt.Printf("indexes: seeding %d orders and %d outbox events...\n", o.rows, o.rows)
+	seed := []string{
+		// Almost every order is finished; a few hundred are stuck in each
+		// open state, which is what the recovery worker looks for.
+		`INSERT INTO orders (id, customer_email, status, total_cents, updated_at, expires_at)
+		 SELECT 'o' || g, 'u@example.com',
+		        CASE WHEN g % 10000 = 0 THEN 'payment_pending'
+		             WHEN g % 10000 = 1 THEN 'stock_reserved'
+		             WHEN g % 10000 = 2 THEN 'pending'
+		             ELSE 'paid' END,
+		        1000, now() - interval '1 hour', now() - interval '1 minute'
+		 FROM generate_series(1, $1) g`,
+		`INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload, status, published_at)
+		 SELECT 'e' || g, 'order', 'o' || g, 'order.paid', '{}',
+		        CASE WHEN g % 20000 = 0 THEN 'pending' ELSE 'published' END,
+		        CASE WHEN g % 20000 = 0 THEN NULL ELSE now() END
+		 FROM generate_series(1, $1) g`,
+	}
+	for _, q := range seed {
+		if _, err := db.Exec(ctx, q, o.rows); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return false
+		}
+	}
+	_, _ = db.Exec(ctx, `VACUUM ANALYZE`)
+
+	queries := []struct{ name, sql string }{
+		{"recovery: stuck payments", `SELECT id FROM orders WHERE status = 'payment_pending' AND updated_at < now() - make_interval(secs => 10) ORDER BY updated_at LIMIT 50`},
+		{"recovery: expired reservations", `SELECT id FROM orders WHERE status = 'stock_reserved' AND expires_at <= now() ORDER BY expires_at LIMIT 50`},
+		{"outbox: claim due events", `SELECT id FROM outbox_events WHERE status = 'pending' AND next_attempt_at <= now() ORDER BY created_at LIMIT 100`},
+	}
+	run := func() []float64 {
+		var out []float64
+		for _, q := range queries {
+			var times []float64
+			for i := 0; i < 7; i++ {
+				var plan []map[string]any
+				if err := db.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+q.sql).Scan(&plan); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					return nil
+				}
+				times = append(times, plan[0]["Execution Time"].(float64))
+			}
+			sort.Float64s(times)
+			out = append(out, times[len(times)/2])
+		}
+		return out
+	}
+	size := func(index string) string {
+		var s string
+		_ = db.QueryRow(ctx, `SELECT pg_size_pretty(pg_relation_size($1))`, index).Scan(&s)
+		return s
+	}
+
+	with := run()
+	sizes := []string{size("idx_orders_open_status"), size("idx_outbox_events_pending")}
+	_, _ = db.Exec(ctx, `DROP INDEX idx_orders_open_status; DROP INDEX idx_outbox_events_pending`)
+	_, _ = db.Exec(ctx, `ANALYZE`)
+	without := run()
+	// What a conventional full index would look like, for size comparison.
+	_, _ = db.Exec(ctx, `CREATE INDEX full_orders_status ON orders (status, updated_at); CREATE INDEX full_outbox_status ON outbox_events (status, created_at)`)
+	fullSizes := []string{size("full_orders_status"), size("full_outbox_status")}
+
+	fmt.Printf("  %-32s %14s %14s %10s\n", "query (median of 7)", "no index", "partial index", "speedup")
+	for i, q := range queries {
+		fmt.Printf("  %-32s %12.2fms %12.3fms %9.0fx\n", q.name, without[i], with[i], without[i]/with[i])
+	}
+	fmt.Printf("  index size: orders partial %s vs full %s; outbox partial %s vs full %s\n", sizes[0], fullSizes[0], sizes[1], fullSizes[1])
+	return true
 }

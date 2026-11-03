@@ -1,40 +1,44 @@
+# Local stack: the five services, their infrastructure, and the observability
+# tools. order-service reaches product and payment through Toxiproxy, which
+# passes traffic through untouched until a chaos test adds faults.
 x-service: &service
-  build:
-    context: .
+  image: order-system:dev
   restart: unless-stopped
+  environment: &env
+    KAFKA_BROKERS: kafka:9092
+    REDIS_ADDR: redis:6379
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    OTEL_EXPORTER_OTLP_INSECURE: "true"
+
+x-pg: &pg postgres://orders:orders@postgres:5432
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-orders}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orders}
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
       POSTGRES_DB: postgres
-    ports:
-      - "5432:5432"
+    ports: ["5432:5432"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./deploy/postgres/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orders}"]
+      test: ["CMD-SHELL", "pg_isready -U orders"]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      retries: 20
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    ports: ["6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      retries: 20
 
   kafka:
     image: apache/kafka:3.7.0
-    ports:
-      - "9094:9094"
+    ports: ["9094:9094"]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -48,79 +52,113 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      # Services create the topics they need with explicit partition counts.
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
       interval: 10s
-      timeout: 10s
-      retries: 12
+      retries: 20
 
-  product-service:
-    <<: *service
-    build: { context: ., args: { SERVICE: product-service } }
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/products?sslmode=disable
-      KAFKA_BROKERS: kafka:9092
-      REDIS_ADDR: redis:6379
-      PRODUCT_GRPC_PORT: 50052
-    depends_on:
-      postgres: { condition: service_healthy }
-      kafka: { condition: service_healthy }
-      redis: { condition: service_healthy }
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    ports: ["8474:8474"]
+    volumes: ["./deploy/toxiproxy.json:/config/toxiproxy.json:ro"]
 
-  payment-service:
-    <<: *service
-    build: { context: ., args: { SERVICE: payment-service } }
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/payments?sslmode=disable
-      PAYMENT_GRPC_PORT: 50053
-      PAYMENT_DECLINE_ABOVE_CENTS: ${PAYMENT_DECLINE_ABOVE_CENTS:-100000}
-      PAYMENT_FAULT_RATE: ${PAYMENT_FAULT_RATE:-0}
-    depends_on:
-      postgres: { condition: service_healthy }
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    ports: ["16686:16686"]
 
-  order-service:
-    <<: *service
-    build: { context: ., args: { SERVICE: order-service } }
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/orders?sslmode=disable
-      KAFKA_BROKERS: kafka:9092
-      PRODUCT_GRPC_ADDR: dns:///product-service:50052
-      PAYMENT_GRPC_ADDR: dns:///payment-service:50053
-      ORDER_GRPC_PORT: 50051
-      ORDER_PAYMENT_WINDOW: ${ORDER_PAYMENT_WINDOW:-15m}
-    depends_on:
-      postgres: { condition: service_healthy }
-      kafka: { condition: service_healthy }
-      product-service: { condition: service_started }
-      payment-service: { condition: service_started }
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports: ["9090:9090"]
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/alerts.yml:/etc/prometheus/alerts.yml:ro
 
-  notification-service:
-    <<: *service
-    build: { context: ., args: { SERVICE: notification-service } }
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports: ["3000:3000"]
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-orders}:${POSTGRES_PASSWORD:-orders}@postgres:5432/notifications?sslmode=disable
-      KAFKA_BROKERS: kafka:9092
-    depends_on:
-      postgres: { condition: service_healthy }
-      kafka: { condition: service_healthy }
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/order-system.json
+    volumes:
+      - ./deploy/observability/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./deploy/observability/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./deploy/observability/grafana/order-system.json:/var/lib/grafana/dashboards/order-system.json:ro
+
+  # Builds the shared image used by every service below.
+  image:
+    image: order-system:dev
+    build: .
+    command: ["true"]
+    restart: "no"
 
   api-gateway:
     <<: *service
-    build: { context: ., args: { SERVICE: api-gateway } }
-    ports:
-      - "8080:8080"
+    command: api-gateway
+    ports: ["8080:8080"]
     environment:
-      API_GATEWAY_PORT: 8080
+      <<: *env
       ORDER_GRPC_ADDR: dns:///order-service:50051
       PRODUCT_GRPC_ADDR: dns:///product-service:50052
-      REDIS_ADDR: redis:6379
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-600}
+    depends_on: [order-service, product-service, redis]
+
+  order-service:
+    <<: *service
+    command: order-service
+    environment:
+      <<: *env
+      DATABASE_URL: postgres://orders:orders@postgres:5432/orders?sslmode=disable
+      PRODUCT_GRPC_ADDR: toxiproxy:21052
+      PAYMENT_GRPC_ADDR: toxiproxy:21053
+      ORDER_PAYMENT_WINDOW: ${ORDER_PAYMENT_WINDOW:-15m}
     depends_on:
-      order-service: { condition: service_started }
-      product-service: { condition: service_started }
-      redis: { condition: service_healthy }
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+
+  product-service:
+    <<: *service
+    command: product-service
+    environment:
+      <<: *env
+      DATABASE_URL: postgres://orders:orders@postgres:5432/products?sslmode=disable
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  payment-service:
+    <<: *service
+    command: payment-service
+    environment:
+      <<: *env
+      DATABASE_URL: postgres://orders:orders@postgres:5432/payments?sslmode=disable
+      PAYMENT_DECLINE_ABOVE_CENTS: ${PAYMENT_DECLINE_ABOVE_CENTS:-100000}
+      PAYMENT_FAULT_RATE: ${PAYMENT_FAULT_RATE:-0}
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  notification-service:
+    <<: *service
+    command: notification-service
+    environment:
+      <<: *env
+      DATABASE_URL: postgres://orders:orders@postgres:5432/notifications?sslmode=disable
+    depends_on:
+      postgres: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+
+  # docker compose run --rm reconciler
+  reconciler:
+    image: order-system:dev
+    command: reconciler
+    profiles: [tools]
+    environment:
+      <<: *env
+      ORDER_GRPC_ADDR: dns:///order-service:50051
+      PAYMENT_GRPC_ADDR: dns:///payment-service:50053
 
 volumes:
   postgres_data:

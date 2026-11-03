@@ -1,0 +1,45 @@
+groups:
+  - name: order-system
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m]))
+            / sum(rate(http_request_duration_seconds_count[5m])) > 0.05
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: More than 5% of API requests fail with 5xx.
+
+      - alert: CircuitBreakerOpen
+        expr: max by (target) (circuit_breaker_state) == 1
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "order-service has stopped calling {{ $labels.target }}."
+
+      - alert: OutboxBacklogGrowing
+        expr: outbox_oldest_pending_seconds > 60
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: Order events are not reaching Kafka; stock and notifications are falling behind.
+
+      - alert: OrdersStuckInRecovery
+        expr: sum(rate(saga_step_outcomes_total{outcome="unknown"}[10m])) > 0 and sum(rate(recovery_actions_total[10m])) == 0
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: Saga steps end with unknown outcomes but the recovery worker settles none.
+
+      - alert: ConsumerLagHigh
+        expr: max by (group) (kafka_consumer_lag) > 1000
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Consumer group {{ $labels.group }} is more than 1000 events behind."
+
+      - alert: MessagesDeadLettered
+        expr: sum by (group) (increase(kafka_messages_consumed_total{outcome="dead_lettered"}[15m])) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "{{ $labels.group }} moved messages to order.events.dlq."

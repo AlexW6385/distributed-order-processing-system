@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  labels: {app: notification-service}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: notification-service}
+  template:
+    metadata:
+      labels: {app: notification-service}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: notification-service
+          image: order-system:dev
+          command: [notification-service]
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: metrics, containerPort: 9090}
+          envFrom:
+            - configMapRef: {name: order-system-config}
+          env:
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: order-system-db, key: notification-service}}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 9090}
+            initialDelaySeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}

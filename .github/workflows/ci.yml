@@ -9,7 +9,7 @@ env:
   PROTOC_VERSION: "29.3"
 
 jobs:
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -18,89 +18,165 @@ jobs:
           POSTGRES_USER: orders
           POSTGRES_PASSWORD: orders
           POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
+        ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U orders"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+          --health-cmd "pg_isready -U orders" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
-        with:
-          go-version: "1.23"
-          cache: true
+        with: {go-version: "1.23", cache: true}
 
-      # The generated files record the protoc version, so CI must use the same
-      # one as `make proto` does locally.
-      - name: Install protoc
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - name: Print tidy go.mod/go.sum
+        if: failure()
         run: |
-          curl -sSL -o /tmp/protoc.zip \
-            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          echo "::group::tidy go.mod"; base64 -w0 go.mod; echo; echo "::endgroup::"
+          echo "::group::tidy go.sum"; base64 -w0 go.sum; echo; echo "::endgroup::"
 
-      - name: Install protobuf Go plugins
-        run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.35.2
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
-
-      - name: Check formatting
+      - name: Formatting
         run: test -z "$(gofmt -l .)"
 
-      - name: Verify generated protobuf files
+      # The generated files record the protoc version, so CI uses the same one.
+      - name: Generated protobuf code is current
         run: |
+          curl -sSL -o /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.35.2
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
           make proto
           git diff --exit-code -- proto gen
 
       - name: Vet
         run: go vet ./...
 
-      - name: Test (unit + integration)
+      - name: Unit and integration tests (Postgres, Redis, race detector)
         env:
           TEST_DATABASE_URL: postgres://orders:orders@localhost:5432/postgres?sslmode=disable
+          TEST_REDIS_ADDR: localhost:6379
         run: go test -race -count=1 ./...
 
-  end-to-end:
+  kubernetes:
     runs-on: ubuntu-latest
-    needs: build-and-test
+    needs: test
+    env:
+      NS: order-system
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version: "1.23", cache: true}
 
-      - name: Validate Compose files
+      - name: Validate Compose and Prometheus config
         run: |
           docker compose config -q
-          POSTGRES_USER=ci POSTGRES_PASSWORD=ci docker compose -f docker-compose.yml -f docker-compose.prod.yml config -q
+          docker run --rm -v "$PWD/deploy/observability:/cfg" --entrypoint promtool prom/prometheus:v2.54.1 check rules /cfg/alerts.yml
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.23"
-          cache: true
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with: {cluster_name: orders}
 
-      - name: Start stack
-        env:
-          RATE_LIMIT_PER_MINUTE: "0"
-        run: docker compose up -d --build --wait --wait-timeout 180
+      - name: Build and load the image
+        run: |
+          docker build -t order-system:dev .
+          kind load docker-image order-system:dev --name orders
+
+      - name: Deploy
+        run: |
+          kubectl apply -k deploy/k8s/dev
+          kubectl -n $NS rollout status statefulset/postgres --timeout=300s
+          kubectl -n $NS rollout status statefulset/kafka --timeout=300s
+          kubectl -n $NS wait --for=condition=available deployment --all --timeout=300s
+          kubectl -n $NS get pods -o wide
+
+      - name: Port-forward
+        run: |
+          for svc in api-gateway:8080 postgres:5432 toxiproxy:8474 jaeger:16686 redis:6379; do
+            kubectl -n $NS port-forward svc/${svc%%:*} ${svc##*:}:${svc##*:} >/tmp/pf-${svc%%:*}.log 2>&1 &
+          done
+          sleep 5
+          go build -o /tmp/loadtest ./loadtest
 
       - name: Smoke tests
-        run: ./scripts/smoke.sh
+        run: /tmp/loadtest smoke
 
-      - name: Load test - no overselling
-        run: go run ./loadtest oversell -orders 1000 -units 100
+      - name: No overselling (1,000 orders for 100 units)
+        run: /tmp/loadtest oversell -orders 1000 -units 100
 
-      - name: Load test - checkout throughput
-        run: go run ./loadtest checkout -c 50 -d 20s
+      - name: Flash sale behind the Redis gate
+        run: /tmp/loadtest flashsale -orders 3000 -units 100
 
-      - name: Load test - payment timeouts
-        env:
-          RATE_LIMIT_PER_MINUTE: "0"
-          PAYMENT_FAULT_RATE: "0.3"
+      - name: Checkout throughput
+        run: /tmp/loadtest checkout -c 50 -d 30s
+
+      - name: Chaos - Toxiproxy faults during load
+        run: /tmp/loadtest chaos -c 20 -d 60s
+
+      - name: Chaos - kill pods during load
         run: |
-          docker compose up -d --wait payment-service
+          (/tmp/loadtest checkout -c 30 -d 40s -warmup 1s > /tmp/kill-load.log 2>&1 || true) &
+          sleep 10
+          kubectl -n $NS delete pod -l app=order-service --wait=false
+          sleep 8
+          kubectl -n $NS delete pod -l app=product-service --wait=false
+          wait
+          tail -8 /tmp/kill-load.log
+          kubectl -n $NS wait --for=condition=available deployment --all --timeout=180s
+          sleep 5
+          for svc in api-gateway:8080 postgres:5432; do
+            pkill -f "port-forward svc/${svc%%:*}" || true
+            kubectl -n $NS port-forward svc/${svc%%:*} ${svc##*:}:${svc##*:} >/tmp/pf-${svc%%:*}.log 2>&1 &
+          done
           sleep 3
-          go run ./loadtest faults -orders 300 -c 30
+          /tmp/loadtest verify
 
-      - name: Service logs
+      - name: Payment timeouts (30% of charges answer too late)
+        run: |
+          kubectl -n $NS set env deployment/payment-service PAYMENT_FAULT_RATE=0.3
+          kubectl -n $NS rollout status deployment/payment-service --timeout=180s
+          sleep 5
+          /tmp/loadtest faults -orders 300 -c 30
+          kubectl -n $NS set env deployment/payment-service PAYMENT_FAULT_RATE=0
+
+      - name: Reconciliation job
+        run: |
+          kubectl -n $NS create job reconcile-ci --from=cronjob/reconciler
+          kubectl -n $NS wait --for=condition=complete job/reconcile-ci --timeout=180s
+          kubectl -n $NS logs job/reconcile-ci | tail -3
+
+      - name: Metrics and traces are collected
+        run: |
+          pkill -f "port-forward svc/jaeger" || true
+          kubectl -n $NS port-forward svc/jaeger 16686:16686 >/tmp/pf-jaeger.log 2>&1 &
+          kubectl -n $NS port-forward svc/prometheus 19090:9090 >/tmp/pf-prometheus.log 2>&1 &
+          sleep 5
+          q() { curl -s --get localhost:19090/api/v1/query --data-urlencode "query=$1" | jq -r '.data.result[0].value[1] // "0"' | cut -d. -f1; }
+          for attempt in $(seq 1 12); do
+            targets=$(q 'count(up{job="order-system"} == 1)')
+            transitions=$(q 'sum(order_transitions_total)')
+            published=$(q 'sum(outbox_published_total)')
+            consumed=$(q 'sum(kafka_messages_consumed_total)')
+            services=$(curl -s localhost:16686/api/services | jq -r '.data | length')
+            # The largest pay trace should span gateway -> order -> payment -> Kafka -> both consumers.
+            spans=$(curl -s "localhost:16686/api/traces?service=api-gateway&operation=%2Forders%2F%3Aid%2Fpay&limit=50" | jq '[.data[].spans | length] | max // 0')
+            echo "targets=$targets transitions=$transitions published=$published consumed=$consumed jaeger_services=$services trace_spans=$spans"
+            if [ "$targets" -ge 8 ] && [ "$transitions" -gt 0 ] && [ "$published" -gt 0 ] && [ "$consumed" -gt 0 ] \
+               && [ "$services" -ge 5 ] && [ "${spans:-0}" -ge 6 ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          cat /tmp/pf-prometheus.log
+          curl -s localhost:19090/api/v1/targets | jq -c '.data.activeTargets[] | {scrapeUrl, health, lastError}' | head -20
+          kubectl -n $NS logs deployment/prometheus --tail=30
+          exit 1
+
+      - name: Diagnostics
         if: failure()
-        run: docker compose logs --no-color
+        run: |
+          kubectl -n $NS get pods -o wide
+          for d in api-gateway order-service product-service payment-service notification-service; do
+            echo "::group::$d"; kubectl -n $NS logs deployment/$d --tail=100 --all-containers || true; echo "::endgroup::"
+          done

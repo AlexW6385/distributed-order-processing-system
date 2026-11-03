@@ -1,0 +1,26 @@
+# Checks every 10 minutes that orders, payments and the ledger agree. A
+# failed Job means a mismatch (see its logs) or that the check could not run.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reconciler
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          containers:
+            - name: reconciler
+              image: order-system:dev
+              command: [reconciler]
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - configMapRef: {name: order-system-config}
+              env:
+                - {name: ORDER_GRPC_ADDR, value: "dns:///order-service:50051"}
+                - {name: PAYMENT_GRPC_ADDR, value: "dns:///payment-service:50053"}

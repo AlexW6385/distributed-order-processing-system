@@ -1,0 +1,14 @@
+# Docker Compose: discover every replica of each service through DNS.
+global:
+  scrape_interval: 5s
+rule_files:
+  - /etc/prometheus/alerts.yml
+scrape_configs:
+  - job_name: order-system
+    dns_sd_configs:
+      - names: [api-gateway, order-service, product-service, payment-service, notification-service]
+        type: A
+        port: 9090
+    relabel_configs:
+      - source_labels: [__meta_dns_name]
+        target_label: service

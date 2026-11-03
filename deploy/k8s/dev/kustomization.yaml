@@ -1,0 +1,33 @@
+# Everything in one namespace: the services, their infrastructure,
+# observability and Toxiproxy.  kubectl apply -k deploy/k8s/dev
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: order-system
+resources:
+  - namespace.yaml
+  - ../base
+  - infra.yaml
+  - ../../observability
+patches:
+  # Route order-service's dependencies through Toxiproxy for chaos tests, and
+  # retry stuck orders quickly.
+  - target: {kind: Deployment, name: order-service}
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/env/1/value
+        value: toxiproxy:21052
+      - op: replace
+        path: /spec/template/spec/containers/0/env/2/value
+        value: toxiproxy:21053
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: {name: RECOVERY_PAYMENT_RETRY_AFTER, value: 3s}
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: {name: RECOVERY_PENDING_TIMEOUT, value: 20s}
+  # The load tests run from one address, so the per-IP limiter is off here.
+  - target: {kind: ConfigMap, name: order-system-config}
+    patch: |
+      - op: replace
+        path: /data/RATE_LIMIT_PER_MINUTE
+        value: "0"

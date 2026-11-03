@@ -125,8 +125,12 @@ func (s *Service) admit(ctx context.Context, orderID, customer string, lines []d
 			reservations.WithLabelValues(resultLabel(err)).Inc()
 			return nil, fmt.Errorf("%w: %v", domain.ErrInsufficientStock, err)
 		case err != nil:
+			// The script may have run before the error (for example the
+			// request was cancelled mid-call). Treat the line as possibly
+			// admitted: undo is a no-op if it was not, and gives the unit back
+			// if the reservation then fails. Postgres decides from here on.
 			slog.WarnContext(ctx, "flash-sale gate unavailable, using database only", "error", err)
-			return admitted, nil
+			return append(admitted, line), nil
 		case ok:
 			admitted = append(admitted, line)
 		}

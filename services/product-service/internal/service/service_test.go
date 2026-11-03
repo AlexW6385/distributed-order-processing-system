@@ -78,6 +78,7 @@ type fakeGate struct {
 	tokens   int32
 	admitted map[string]bool
 	down     bool
+	lostAck  bool // admit succeeds in Redis but the caller sees an error
 }
 
 func (g *fakeGate) Start(ctx context.Context, productID string, stock int) error {
@@ -98,6 +99,9 @@ func (g *fakeGate) Admit(ctx context.Context, productID, orderID, customer strin
 	}
 	g.tokens -= qty
 	g.admitted[orderID] = true
+	if g.lostAck {
+		return false, errors.New("context canceled")
+	}
 	return true, nil
 }
 func (g *fakeGate) Undo(ctx context.Context, productID, orderID, customer string, qty int32) error {
@@ -202,6 +206,21 @@ func TestFlashSaleReturnsUnitsWhenRequestIsCancelled(t *testing.T) {
 	_ = svc.StartFlashSale(context.Background(), "hot", 1)
 	if _, _, err := svc.ReserveStock(ctx, "o1", "c", []domain.ReservationLine{{ProductID: "hot", Quantity: 1}}); err == nil {
 		t.Fatal("expected the cancelled reservation to fail")
+	}
+	if gate.tokens != 1 {
+		t.Fatalf("tokens = %d, want 1 (unit returned)", gate.tokens)
+	}
+}
+
+// Regression: the Lua script ran but the caller got an error, then the
+// reservation failed; the unit was never given back.
+func TestFlashSaleReturnsUnitsWhenAdmissionOutcomeIsUnknown(t *testing.T) {
+	repo, gate := &fakeRepo{reserveFn: func() error { return context.DeadlineExceeded }}, &fakeGate{}
+	svc := New(repo, nil, gate)
+	_ = svc.StartFlashSale(context.Background(), "hot", 1)
+	gate.lostAck = true
+	if _, _, err := svc.ReserveStock(context.Background(), "o1", "c", []domain.ReservationLine{{ProductID: "hot", Quantity: 1}}); err == nil {
+		t.Fatal("expected the reservation to fail")
 	}
 	if gate.tokens != 1 {
 		t.Fatalf("tokens = %d, want 1 (unit returned)", gate.tokens)

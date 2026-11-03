@@ -19,14 +19,17 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PaymentService_PayOrder_FullMethodName = "/payment.v1.PaymentService/PayOrder"
+	PaymentService_Charge_FullMethodName = "/payment.v1.PaymentService/Charge"
 )
 
 // PaymentServiceClient is the client API for PaymentService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type PaymentServiceClient interface {
-	PayOrder(ctx context.Context, in *PayOrderRequest, opts ...grpc.CallOption) (*PayOrderResponse, error)
+	// Charge charges an order at most once. The order ID is the idempotency
+	// key: calling Charge again for the same order returns the original result,
+	// so callers can retry safely after a timeout.
+	Charge(ctx context.Context, in *ChargeRequest, opts ...grpc.CallOption) (*ChargeResponse, error)
 }
 
 type paymentServiceClient struct {
@@ -37,10 +40,10 @@ func NewPaymentServiceClient(cc grpc.ClientConnInterface) PaymentServiceClient {
 	return &paymentServiceClient{cc}
 }
 
-func (c *paymentServiceClient) PayOrder(ctx context.Context, in *PayOrderRequest, opts ...grpc.CallOption) (*PayOrderResponse, error) {
+func (c *paymentServiceClient) Charge(ctx context.Context, in *ChargeRequest, opts ...grpc.CallOption) (*ChargeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(PayOrderResponse)
-	err := c.cc.Invoke(ctx, PaymentService_PayOrder_FullMethodName, in, out, cOpts...)
+	out := new(ChargeResponse)
+	err := c.cc.Invoke(ctx, PaymentService_Charge_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +54,10 @@ func (c *paymentServiceClient) PayOrder(ctx context.Context, in *PayOrderRequest
 // All implementations must embed UnimplementedPaymentServiceServer
 // for forward compatibility.
 type PaymentServiceServer interface {
-	PayOrder(context.Context, *PayOrderRequest) (*PayOrderResponse, error)
+	// Charge charges an order at most once. The order ID is the idempotency
+	// key: calling Charge again for the same order returns the original result,
+	// so callers can retry safely after a timeout.
+	Charge(context.Context, *ChargeRequest) (*ChargeResponse, error)
 	mustEmbedUnimplementedPaymentServiceServer()
 }
 
@@ -62,8 +68,8 @@ type PaymentServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedPaymentServiceServer struct{}
 
-func (UnimplementedPaymentServiceServer) PayOrder(context.Context, *PayOrderRequest) (*PayOrderResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method PayOrder not implemented")
+func (UnimplementedPaymentServiceServer) Charge(context.Context, *ChargeRequest) (*ChargeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Charge not implemented")
 }
 func (UnimplementedPaymentServiceServer) mustEmbedUnimplementedPaymentServiceServer() {}
 func (UnimplementedPaymentServiceServer) testEmbeddedByValue()                        {}
@@ -86,20 +92,20 @@ func RegisterPaymentServiceServer(s grpc.ServiceRegistrar, srv PaymentServiceSer
 	s.RegisterService(&PaymentService_ServiceDesc, srv)
 }
 
-func _PaymentService_PayOrder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(PayOrderRequest)
+func _PaymentService_Charge_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChargeRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(PaymentServiceServer).PayOrder(ctx, in)
+		return srv.(PaymentServiceServer).Charge(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: PaymentService_PayOrder_FullMethodName,
+		FullMethod: PaymentService_Charge_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PaymentServiceServer).PayOrder(ctx, req.(*PayOrderRequest))
+		return srv.(PaymentServiceServer).Charge(ctx, req.(*ChargeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -112,8 +118,8 @@ var PaymentService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*PaymentServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "PayOrder",
-			Handler:    _PaymentService_PayOrder_Handler,
+			MethodName: "Charge",
+			Handler:    _PaymentService_Charge_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

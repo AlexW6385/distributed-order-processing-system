@@ -1,50 +1,34 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"net"
+	"time"
 
 	paymentv1 "github.com/AlexW6385/distributed-order-processing-system/gen/payment/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/app"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/config"
-	platformdb "github.com/AlexW6385/distributed-order-processing-system/internal/platform/db"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/grpcx"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/repository"
 	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/service"
 	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/transport/grpcapi"
-	"github.com/go-redis/redis/v8"
-	"google.golang.org/grpc"
+	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/migrations"
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, stop := app.SignalContext()
+	defer stop()
 	log := logging.New("payment-service")
 
-	db, err := platformdb.Open(ctx, config.String("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable"))
-	if err != nil {
-		log.Error("database connection failed", err, nil)
-		panic(err)
-	}
+	db := app.OpenDB(ctx, log, config.String("DATABASE_URL", "postgres://orders:orders@localhost:5432/payments?sslmode=disable"), migrations.FS)
 	defer db.Close()
 
-	redisClient := redis.NewClient(&redis.Options{Addr: config.String("REDIS_ADDR", "localhost:6379")})
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		log.Error("redis connection failed", err, nil)
-		panic(err)
-	}
-	defer redisClient.Close()
+	svc := service.New(repository.New(db), service.Config{
+		DeclineAboveCents: int64(config.Int("PAYMENT_DECLINE_ABOVE_CENTS", 100_000)),
+		FaultRate:         config.Float("PAYMENT_FAULT_RATE", 0),
+		FaultDelay:        config.Duration("PAYMENT_FAULT_DELAY", 5*time.Second),
+	})
 
-	port := config.String("PAYMENT_GRPC_PORT", "50053")
-	listener, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		log.Error("listen failed", err, nil)
-		panic(err)
-	}
-
-	server := grpc.NewServer()
-	paymentv1.RegisterPaymentServiceServer(server, grpcapi.New(service.New(repository.New(db), redisClient)))
-	log.Info("grpc server started", map[string]any{"addr": fmt.Sprintf(":%s", port)})
-	if err := server.Serve(listener); err != nil {
-		log.Error("grpc server stopped", err, nil)
-	}
+	server := grpcx.NewServer(log)
+	paymentv1.RegisterPaymentServiceServer(server, grpcapi.New(svc))
+	app.ServeGRPC(ctx, log, server, config.String("PAYMENT_GRPC_PORT", "50053"))
 }

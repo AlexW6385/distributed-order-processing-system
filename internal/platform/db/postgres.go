@@ -7,6 +7,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Open connects to Postgres, retrying while the database is still starting.
 func Open(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -20,7 +21,19 @@ func Open(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := pool.Ping(ctx); err != nil {
+	for attempt := 0; ; attempt++ {
+		err = pool.Ping(ctx)
+		if err == nil || attempt == 30 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			pool.Close()
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	if err != nil {
 		pool.Close()
 		return nil, err
 	}

@@ -2,7 +2,7 @@ package service
 
 import (
 	"context"
-	"errors"
+	"fmt"
 
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/domain"
 )
@@ -10,8 +10,8 @@ import (
 type Repository interface {
 	ListProducts(ctx context.Context) ([]domain.Product, error)
 	ReserveStock(ctx context.Context, orderID string, lines []domain.ReservationLine) ([]domain.ReservedItem, int64, error)
-	ReleaseReservation(ctx context.Context, orderID string) error
-	ConfirmReservation(ctx context.Context, orderID string) error
+	Release(ctx context.Context, orderID string) error
+	Confirm(ctx context.Context, orderID string) error
 }
 
 type Service struct {
@@ -28,29 +28,30 @@ func (s *Service) ListProducts(ctx context.Context) ([]domain.Product, error) {
 
 func (s *Service) ReserveStock(ctx context.Context, orderID string, lines []domain.ReservationLine) ([]domain.ReservedItem, int64, error) {
 	if orderID == "" {
-		return nil, 0, errors.New("order id is required")
+		return nil, 0, fmt.Errorf("%w: order id is required", domain.ErrInvalid)
 	}
 	if len(lines) == 0 {
-		return nil, 0, errors.New("at least one item is required")
+		return nil, 0, fmt.Errorf("%w: at least one item is required", domain.ErrInvalid)
 	}
+	seen := map[string]bool{}
 	for _, line := range lines {
 		if line.ProductID == "" || line.Quantity <= 0 {
-			return nil, 0, errors.New("each item needs a product id and positive quantity")
+			return nil, 0, fmt.Errorf("%w: each item needs a product id and positive quantity", domain.ErrInvalid)
 		}
+		if seen[line.ProductID] {
+			return nil, 0, fmt.Errorf("%w: duplicate product %s", domain.ErrInvalid, line.ProductID)
+		}
+		seen[line.ProductID] = true
 	}
 	return s.repo.ReserveStock(ctx, orderID, lines)
 }
 
-func (s *Service) ReleaseReservation(ctx context.Context, orderID string) error {
-	if orderID == "" {
-		return errors.New("order id is required")
-	}
-	return s.repo.ReleaseReservation(ctx, orderID)
+// Release and Confirm are driven by order events, not by RPCs.
+
+func (s *Service) Release(ctx context.Context, orderID string) error {
+	return s.repo.Release(ctx, orderID)
 }
 
-func (s *Service) ConfirmReservation(ctx context.Context, orderID string) error {
-	if orderID == "" {
-		return errors.New("order id is required")
-	}
-	return s.repo.ConfirmReservation(ctx, orderID)
+func (s *Service) Confirm(ctx context.Context, orderID string) error {
+	return s.repo.Confirm(ctx, orderID)
 }

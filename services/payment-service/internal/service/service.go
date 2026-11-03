@@ -1,72 +1,98 @@
+// Package service simulates a payment provider.
+//
+// It is deliberately unreliable when configured to be: FaultRate makes some
+// charges succeed but answer slowly, so the caller times out without knowing
+// the outcome. That is the failure a real payment integration has to survive.
 package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/AlexW6385/distributed-order-processing-system/services/payment-service/internal/domain"
-	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
 )
 
 type Repository interface {
-	FindByIdempotencyKey(ctx context.Context, key string) (*domain.Payment, error)
-	CreateSucceeded(ctx context.Context, orderID string, amountCents int64, key string) (*domain.Payment, error)
+	Insert(ctx context.Context, p domain.Payment) (*domain.Payment, error)
+	FindByOrder(ctx context.Context, orderID string) (*domain.Payment, error)
+}
+
+type Config struct {
+	// DeclineAboveCents declines charges above this amount. 0 disables.
+	DeclineAboveCents int64
+	// FaultRate is the probability (0..1) that a new charge is recorded but
+	// the response is delayed by FaultDelay.
+	FaultRate  float64
+	FaultDelay time.Duration
 }
 
 type Service struct {
-	repo  Repository
-	redis *redis.Client
+	repo Repository
+	cfg  Config
 }
 
-func New(repo Repository, redisClient *redis.Client) *Service {
-	return &Service{repo: repo, redis: redisClient}
+func New(repo Repository, cfg Config) *Service {
+	if cfg.FaultDelay <= 0 {
+		cfg.FaultDelay = 5 * time.Second
+	}
+	return &Service{repo: repo, cfg: cfg}
 }
 
-func (s *Service) PayOrder(ctx context.Context, orderID string, amountCents int64, key string) (*domain.Payment, error) {
+// Charge charges an order at most once and returns the recorded result.
+func (s *Service) Charge(ctx context.Context, orderID string, amountCents int64, key string) (*domain.Payment, error) {
 	if orderID == "" {
-		return nil, errors.New("order id is required")
+		return nil, fmt.Errorf("%w: order id is required", domain.ErrInvalid)
 	}
 	if amountCents <= 0 {
-		return nil, errors.New("amount must be positive")
-	}
-	if key == "" {
-		return nil, errors.New("idempotency key is required")
+		return nil, fmt.Errorf("%w: amount must be positive", domain.ErrInvalid)
 	}
 
-	existing, err := s.repo.FindByIdempotencyKey(ctx, key)
+	if existing, err := s.repo.FindByOrder(ctx, orderID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return s.checkReplay(existing, amountCents)
+	}
+
+	payment := domain.Payment{
+		ID:             uuid.NewString(),
+		OrderID:        orderID,
+		IdempotencyKey: key,
+		AmountCents:    amountCents,
+		Status:         domain.StatusSucceeded,
+	}
+	if s.cfg.DeclineAboveCents > 0 && amountCents > s.cfg.DeclineAboveCents {
+		payment.Status = domain.StatusDeclined
+		payment.DeclineReason = fmt.Sprintf("amount exceeds limit of %d cents", s.cfg.DeclineAboveCents)
+	}
+
+	stored, err := s.repo.Insert(ctx, payment)
 	if err != nil {
 		return nil, err
 	}
-	if existing != nil {
-		if existing.OrderID != orderID || existing.AmountCents != amountCents {
-			return nil, errors.New("idempotency key was used for a different payment")
-		}
-		return existing, nil
+	if stored.ID != payment.ID {
+		// A concurrent charge for the same order won the insert.
+		return s.checkReplay(stored, amountCents)
 	}
 
-	lockKey := fmt.Sprintf("payment:idempotency:%s", key)
-	locked, err := s.redis.SetNX(ctx, lockKey, "processing", 24*time.Hour).Result()
-	if err != nil {
-		return nil, err
-	}
-	if !locked {
-		existing, err := s.repo.FindByIdempotencyKey(ctx, key)
-		if err != nil {
-			return nil, err
+	if s.cfg.FaultRate > 0 && rand.Float64() < s.cfg.FaultRate {
+		// The charge is committed, but the caller will likely give up before
+		// it hears back.
+		select {
+		case <-time.After(s.cfg.FaultDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		if existing != nil {
-			return existing, nil
-		}
-		return nil, errors.New("payment with this idempotency key is already processing")
 	}
+	return stored, nil
+}
 
-	payment, err := s.repo.CreateSucceeded(ctx, orderID, amountCents, key)
-	if err != nil {
-		_ = s.redis.Del(ctx, lockKey).Err()
-		return nil, err
+func (s *Service) checkReplay(existing *domain.Payment, amountCents int64) (*domain.Payment, error) {
+	if existing.AmountCents != amountCents {
+		return nil, fmt.Errorf("%w: order %s was charged %d cents, not %d",
+			domain.ErrMismatch, existing.OrderID, existing.AmountCents, amountCents)
 	}
-	_ = s.redis.Set(ctx, lockKey, payment.ID, 24*time.Hour).Err()
-	return payment, nil
+	return existing, nil
 }

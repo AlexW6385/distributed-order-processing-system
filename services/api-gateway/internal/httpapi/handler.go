@@ -18,12 +18,13 @@ func New(orders orderv1.OrderServiceClient, products productv1.ProductServiceCli
 	return &Handler{orders: orders, products: products}
 }
 
-func (h *Handler) Register(router *gin.Engine) {
+func (h *Handler) Register(router gin.IRouter) {
 	router.GET("/health", h.health)
 	router.GET("/products", h.listProducts)
 	router.POST("/orders", h.createOrder)
 	router.GET("/orders/:id", h.getOrder)
 	router.POST("/orders/:id/pay", h.payOrder)
+	router.POST("/orders/:id/cancel", h.cancelOrder)
 }
 
 func (h *Handler) health(c *gin.Context) {
@@ -58,8 +59,9 @@ func (h *Handler) createOrder(c *gin.Context) {
 		items = append(items, &orderv1.OrderItemInput{ProductId: item.ProductID, Quantity: item.Quantity})
 	}
 	resp, err := h.orders.CreateOrder(c.Request.Context(), &orderv1.CreateOrderRequest{
-		CustomerEmail: body.CustomerEmail,
-		Items:         items,
+		CustomerEmail:  body.CustomerEmail,
+		Items:          items,
+		IdempotencyKey: c.GetHeader("Idempotency-Key"),
 	})
 	if err != nil {
 		httpjson.Error(c, err)
@@ -77,21 +79,31 @@ func (h *Handler) getOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"order": resp.Order})
 }
 
-type payOrderRequest struct {
-	IdempotencyKey string `json:"idempotency_key"`
-}
-
+// payOrder answers 200 when the order is paid or failed, and 202 when the
+// payment outcome is still unknown; the client should poll GET /orders/{id}.
 func (h *Handler) payOrder(c *gin.Context) {
-	var body payOrderRequest
-	_ = c.ShouldBindJSON(&body)
 	key := c.GetHeader("Idempotency-Key")
 	if key == "" {
-		key = body.IdempotencyKey
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key header is required"})
+		return
 	}
 	resp, err := h.orders.PayOrder(c.Request.Context(), &orderv1.PayOrderRequest{
 		OrderId:        c.Param("id"),
 		IdempotencyKey: key,
 	})
+	if err != nil {
+		httpjson.Error(c, err)
+		return
+	}
+	code := http.StatusOK
+	if resp.Order.Status == "payment_pending" {
+		code = http.StatusAccepted
+	}
+	c.JSON(code, gin.H{"order": resp.Order})
+}
+
+func (h *Handler) cancelOrder(c *gin.Context) {
+	resp, err := h.orders.CancelOrder(c.Request.Context(), &orderv1.CancelOrderRequest{OrderId: c.Param("id")})
 	if err != nil {
 		httpjson.Error(c, err)
 		return

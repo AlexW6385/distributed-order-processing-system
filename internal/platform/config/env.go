@@ -1,8 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func String(key, fallback string) string {
@@ -24,4 +27,41 @@ func CSV(key, fallback string) []string {
 		}
 	}
 	return out
+}
+
+// Duration parses a Go duration such as "15m" or "500ms".
+func Duration(key string, fallback time.Duration) time.Duration {
+	raw := String(key, "")
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		panic(fmt.Sprintf("config %s: %v", key, err))
+	}
+	return d
+}
+
+func Int(key string, fallback int) int {
+	raw := String(key, "")
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		panic(fmt.Sprintf("config %s: %v", key, err))
+	}
+	return n
+}
+
+func Float(key string, fallback float64) float64 {
+	raw := String(key, "")
+	if raw == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		panic(fmt.Sprintf("config %s: %v", key, err))
+	}
+	return f
 }

@@ -4,11 +4,13 @@ package product.v1;
 
 option go_package = "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1;productv1";
 
+// ProductService owns the catalog and stock. Reservations are created over
+// gRPC; they are confirmed or released by consuming order events.
 service ProductService {
   rpc ListProducts(ListProductsRequest) returns (ListProductsResponse);
+  // ReserveStock is idempotent per order_id. It fails with FailedPrecondition
+  // if stock is insufficient or the order's reservation was already released.
   rpc ReserveStock(ReserveStockRequest) returns (ReserveStockResponse);
-  rpc ReleaseReservation(ReleaseReservationRequest) returns (ReleaseReservationResponse);
-  rpc ConfirmReservation(ConfirmReservationRequest) returns (ConfirmReservationResponse);
 }
 
 message Product {
@@ -47,15 +49,3 @@ message ReserveStockResponse {
   repeated ReservedItem items = 1;
   int64 total_cents = 2;
 }
-
-message ReleaseReservationRequest {
-  string order_id = 1;
-}
-
-message ReleaseReservationResponse {}
-
-message ConfirmReservationRequest {
-  string order_id = 1;
-}
-
-message ConfirmReservationResponse {}

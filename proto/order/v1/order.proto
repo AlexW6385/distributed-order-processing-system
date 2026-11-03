@@ -5,9 +5,15 @@ package order.v1;
 option go_package = "github.com/AlexW6385/distributed-order-processing-system/gen/order/v1;orderv1";
 
 service OrderService {
+  // CreateOrder creates an order and reserves stock for it. Replaying a
+  // request with the same idempotency_key returns the original order.
   rpc CreateOrder(CreateOrderRequest) returns (OrderResponse);
   rpc GetOrder(GetOrderRequest) returns (OrderResponse);
+  // PayOrder charges a reserved order. If the payment outcome is not known
+  // yet, the order is returned in status payment_pending and settles later.
   rpc PayOrder(PayOrderRequest) returns (OrderResponse);
+  // CancelOrder cancels an order that has stock reserved but is not paid.
+  rpc CancelOrder(CancelOrderRequest) returns (OrderResponse);
 }
 
 message OrderItemInput {
@@ -32,11 +38,14 @@ message Order {
   string failure_reason = 6;
   string created_at = 7;
   string updated_at = 8;
+  // expires_at is the payment deadline for a reserved order (RFC 3339).
+  string expires_at = 9;
 }
 
 message CreateOrderRequest {
   string customer_email = 1;
   repeated OrderItemInput items = 2;
+  string idempotency_key = 3;
 }
 
 message GetOrderRequest {
@@ -46,6 +55,10 @@ message GetOrderRequest {
 message PayOrderRequest {
   string order_id = 1;
   string idempotency_key = 2;
+}
+
+message CancelOrderRequest {
+  string order_id = 1;
 }
 
 message OrderResponse {

@@ -1,89 +1,64 @@
 package main
 
 import (
-	"context"
-	"fmt"
-	"net"
-	"os"
-	"os/signal"
-	"syscall"
+	"time"
 
 	orderv1 "github.com/AlexW6385/distributed-order-processing-system/gen/order/v1"
 	paymentv1 "github.com/AlexW6385/distributed-order-processing-system/gen/payment/v1"
 	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/contracts/events"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/app"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/config"
-	platformdb "github.com/AlexW6385/distributed-order-processing-system/internal/platform/db"
+	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/grpcx"
 	platformkafka "github.com/AlexW6385/distributed-order-processing-system/internal/platform/kafka"
 	"github.com/AlexW6385/distributed-order-processing-system/internal/platform/logging"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/clients"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/outbox"
+	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/recovery"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/repository"
 	orderservice "github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/service"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/transport/grpcapi"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/migrations"
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := app.SignalContext()
 	defer stop()
 	log := logging.New("order-service")
 
-	db, err := platformdb.Open(ctx, config.String("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable"))
-	if err != nil {
-		log.Error("database connection failed", err, nil)
-		panic(err)
-	}
+	db := app.OpenDB(ctx, log, config.String("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable"), migrations.FS)
 	defer db.Close()
 
-	productConn, err := grpc.NewClient(config.String("PRODUCT_GRPC_ADDR", "localhost:50052"), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Error("product grpc connection failed", err, nil)
-		panic(err)
-	}
+	callTimeout := config.Duration("GRPC_CALL_TIMEOUT", 2*time.Second)
+	productConn, err := grpcx.Dial(config.String("PRODUCT_GRPC_ADDR", "localhost:50052"), callTimeout)
+	app.Must(log, "dial product-service", err)
 	defer productConn.Close()
-
-	paymentConn, err := grpc.NewClient(config.String("PAYMENT_GRPC_ADDR", "localhost:50053"), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Error("payment grpc connection failed", err, nil)
-		panic(err)
-	}
+	paymentConn, err := grpcx.Dial(config.String("PAYMENT_GRPC_ADDR", "localhost:50053"), callTimeout)
+	app.Must(log, "dial payment-service", err)
 	defer paymentConn.Close()
 
-	repo := repository.New(db)
 	brokers := config.CSV("KAFKA_BROKERS", "localhost:9094")
-	topic := config.String("ORDER_PAID_TOPIC", "order.paid")
-	if err := platformkafka.EnsureTopic(ctx, brokers[0], topic); err != nil {
-		log.Error("kafka topic setup failed", err, map[string]any{"topic": topic})
-		panic(err)
-	}
-	writer := platformkafka.NewWriter(brokers, topic)
+	app.Must(log, "ensure kafka topic", platformkafka.EnsureTopic(ctx, brokers, events.Topic, config.Int("ORDER_EVENTS_PARTITIONS", 3)))
+	writer := platformkafka.NewWriter(brokers, events.Topic)
 	defer writer.Close()
-	go outbox.New(repo, writer, log).Run(ctx)
 
+	repo := repository.New(db)
 	svc := orderservice.New(
 		repo,
 		clients.NewProductClient(productv1.NewProductServiceClient(productConn)),
 		clients.NewPaymentClient(paymentv1.NewPaymentServiceClient(paymentConn)),
+		orderservice.Config{PaymentWindow: config.Duration("ORDER_PAYMENT_WINDOW", 15*time.Minute)},
 		log,
 	)
 
-	port := config.String("ORDER_GRPC_PORT", "50051")
-	listener, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		log.Error("listen failed", err, nil)
-		panic(err)
-	}
+	go outbox.New(repo, writer, outbox.Config{}, log).Run(ctx)
+	go recovery.New(repo, svc, recovery.Config{
+		Interval:          config.Duration("RECOVERY_INTERVAL", 5*time.Second),
+		PendingTimeout:    config.Duration("RECOVERY_PENDING_TIMEOUT", time.Minute),
+		PaymentRetryAfter: config.Duration("RECOVERY_PAYMENT_RETRY_AFTER", 10*time.Second),
+	}, log).Run(ctx)
 
-	server := grpc.NewServer()
+	server := grpcx.NewServer(log)
 	orderv1.RegisterOrderServiceServer(server, grpcapi.New(svc))
-	go func() {
-		<-ctx.Done()
-		server.GracefulStop()
-	}()
-
-	log.Info("grpc server started", map[string]any{"addr": fmt.Sprintf(":%s", port)})
-	if err := server.Serve(listener); err != nil {
-		log.Error("grpc server stopped", err, nil)
-	}
+	app.ServeGRPC(ctx, log, server, config.String("ORDER_GRPC_PORT", "50051"))
 }

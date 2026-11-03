@@ -3,10 +3,15 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
 
+	"github.com/AlexW6385/distributed-order-processing-system/internal/contracts/events"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/domain"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -18,161 +23,333 @@ func New(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
 }
 
-func (r *Repository) CreatePending(ctx context.Context, email string) (*domain.Order, error) {
-	order := &domain.Order{
-		ID:            uuid.NewString(),
-		CustomerEmail: email,
-		Status:        domain.StatusPending,
+const orderColumns = `id, customer_email, status, total_cents, failure_reason, payment_key, expires_at, created_at, updated_at`
+
+// CreatePending inserts a new pending order. When createKey is not empty and
+// an order with that key already exists, the existing order is returned and
+// created is false.
+func (r *Repository) CreatePending(ctx context.Context, email, createKey string) (order *domain.Order, created bool, err error) {
+	var key any
+	if createKey != "" {
+		key = createKey
 	}
-	err := r.db.QueryRow(ctx, `
-		INSERT INTO orders (id, customer_email, status)
-		VALUES ($1, $2, $3)
-		RETURNING created_at, updated_at`, order.ID, order.CustomerEmail, order.Status).
-		Scan(&order.CreatedAt, &order.UpdatedAt)
+	row := r.db.QueryRow(ctx, `
+		INSERT INTO orders (id, customer_email, status, create_key)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (create_key) DO NOTHING
+		RETURNING `+orderColumns, uuid.NewString(), email, domain.StatusPending, key)
+	order, err = scanOrder(row)
+	if errors.Is(err, domain.ErrNotFound) && createKey != "" {
+		existing, err := r.getBy(ctx, r.db, `create_key = $1`, createKey)
+		return existing, false, err
+	}
 	if err != nil {
+		return nil, false, err
+	}
+	return order, true, nil
+}
+
+// MarkReserved moves a pending order to stock_reserved and stores its items.
+func (r *Repository) MarkReserved(ctx context.Context, orderID string, items []domain.Item, totalCents int64, expiresAt time.Time) (*domain.Order, error) {
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		order, err := transition(ctx, tx, orderID, []string{domain.StatusPending}, domain.StatusStockReserved,
+			`total_cents = $4, expires_at = $5`, totalCents, expiresAt)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range items {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price_cents, subtotal_cents)
+				VALUES ($1, $2, $3, $4, $5, $6)`,
+				orderID, item.ProductID, item.ProductName, item.Quantity, item.UnitPriceCents, item.SubtotalCents); err != nil {
+				return nil, err
+			}
+		}
+		order.Items = items
+		return order, nil
+	})
+}
+
+// StartPayment claims a reserved, unexpired order for payment. Exactly one of
+// any number of concurrent callers succeeds; the rest get ErrConflict.
+func (r *Repository) StartPayment(ctx context.Context, orderID, paymentKey string) (*domain.Order, error) {
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		return transition(ctx, tx, orderID, []string{domain.StatusStockReserved}, domain.StatusPaymentPending,
+			`payment_key = $4`, paymentKey, extraWhere(`expires_at > now()`))
+	})
+}
+
+// MarkPaid records a successful payment and emits order.paid in the same
+// transaction (transactional outbox).
+func (r *Repository) MarkPaid(ctx context.Context, orderID string) (*domain.Order, error) {
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		order, err := transition(ctx, tx, orderID, []string{domain.StatusPaymentPending}, domain.StatusPaid, "")
+		if err != nil {
+			return nil, err
+		}
+		return order, insertEvent(ctx, tx, order, events.OrderPaid, "")
+	})
+}
+
+// Close moves an order from one of the given states to a terminal failure
+// state (failed, expired or cancelled) and emits the matching event, which
+// tells product-service to release the order's stock.
+func (r *Repository) Close(ctx context.Context, orderID string, from []string, to, reason string) (*domain.Order, error) {
+	eventType, ok := closingEvents[to]
+	if !ok {
+		return nil, fmt.Errorf("%s is not a closing status", to)
+	}
+	return r.inTx(ctx, func(tx pgx.Tx) (*domain.Order, error) {
+		order, err := transition(ctx, tx, orderID, from, to, `failure_reason = $4`, reason)
+		if err != nil {
+			return nil, err
+		}
+		return order, insertEvent(ctx, tx, order, eventType, reason)
+	})
+}
+
+var closingEvents = map[string]string{
+	domain.StatusFailed:    events.OrderFailed,
+	domain.StatusExpired:   events.OrderExpired,
+	domain.StatusCancelled: events.OrderCancelled,
+}
+
+func (r *Repository) Get(ctx context.Context, orderID string) (*domain.Order, error) {
+	return r.getBy(ctx, r.db, `id = $1`, orderID)
+}
+
+// Stuck returns up to limit orders that have been in status for longer than
+// olderThan.
+func (r *Repository) Stuck(ctx context.Context, status string, olderThan time.Duration, limit int) ([]domain.Order, error) {
+	return r.list(ctx, `
+		SELECT `+orderColumns+` FROM orders
+		WHERE status = $1 AND updated_at < now() - make_interval(secs => $2)
+		ORDER BY updated_at
+		LIMIT $3`, status, olderThan.Seconds(), limit)
+}
+
+// PastDeadline returns reserved orders whose payment deadline has passed.
+func (r *Repository) PastDeadline(ctx context.Context, limit int) ([]domain.Order, error) {
+	return r.list(ctx, `
+		SELECT `+orderColumns+` FROM orders
+		WHERE status = $1 AND expires_at <= now()
+		ORDER BY expires_at
+		LIMIT $2`, domain.StatusStockReserved, limit)
+}
+
+// ClaimOutbox locks up to limit due events with FOR UPDATE SKIP LOCKED and
+// passes them to publish while the lock is held. Several publisher replicas can
+// run at once: each one skips rows another replica has locked. publish returns
+// the IDs it delivered; the rest are rescheduled with exponential backoff.
+func (r *Repository) ClaimOutbox(ctx context.Context, limit, maxAttempts int, publish func([]domain.OutboxEvent) (delivered map[string]bool, err error)) (int, error) {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	rows, err := tx.Query(ctx, `
+		SELECT id, aggregate_id, event_type, payload, attempts
+		FROM outbox_events
+		WHERE status = 'pending' AND next_attempt_at <= now()
+		ORDER BY created_at
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return 0, err
+	}
+	var batch []domain.OutboxEvent
+	for rows.Next() {
+		var e domain.OutboxEvent
+		if err := rows.Scan(&e.ID, &e.AggregateID, &e.EventType, &e.Payload, &e.Attempts); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		batch = append(batch, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(batch) == 0 {
+		return 0, nil
+	}
+
+	delivered, publishErr := publish(batch)
+	lastError := ""
+	if publishErr != nil {
+		lastError = publishErr.Error()
+	}
+	for _, e := range batch {
+		if delivered[e.ID] {
+			if _, err := tx.Exec(ctx, `
+				UPDATE outbox_events SET status = 'published', published_at = now(), attempts = attempts + 1
+				WHERE id = $1`, e.ID); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		backoff := time.Duration(1<<min(e.Attempts, 8)) * time.Second
+		if _, err := tx.Exec(ctx, `
+			UPDATE outbox_events
+			SET attempts = attempts + 1,
+			    last_error = $2,
+			    next_attempt_at = now() + make_interval(secs => $3),
+			    status = CASE WHEN attempts + 1 >= $4 THEN 'failed' ELSE 'pending' END
+			WHERE id = $1`, e.ID, lastError, backoff.Seconds(), maxAttempts); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return len(delivered), publishErr
+}
+
+// --- helpers ---------------------------------------------------------------
+
+type extraWhere string
+
+// transition runs a guarded UPDATE: it only matches the row while the order is
+// still in one of the from states. set holds extra assignments using
+// placeholders from $4 on; args fill them. An extraWhere arg adds a condition.
+func transition(ctx context.Context, tx pgx.Tx, orderID string, from []string, to, set string, args ...any) (*domain.Order, error) {
+	where := ""
+	params := []any{orderID, to, from}
+	for _, a := range args {
+		if w, ok := a.(extraWhere); ok {
+			where += " AND " + string(w)
+			continue
+		}
+		params = append(params, a)
+	}
+	if set != "" {
+		set = ", " + set
+	}
+	row := tx.QueryRow(ctx, `
+		UPDATE orders SET status = $2, updated_at = now()`+set+`
+		WHERE id = $1 AND status = ANY($3)`+where+`
+		RETURNING `+orderColumns, params...)
+	order, err := scanOrder(row)
+	if errors.Is(err, domain.ErrNotFound) {
+		// Distinguish "no such order" from "order is in another state".
+		var status string
+		if err := tx.QueryRow(ctx, `SELECT status FROM orders WHERE id = $1`, orderID).Scan(&status); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, domain.ErrNotFound
+			}
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: order is %s", domain.ErrConflict, status)
+	}
+	return order, err
+}
+
+func insertEvent(ctx context.Context, tx pgx.Tx, order *domain.Order, eventType, reason string) error {
+	event := events.OrderEvent{
+		EventID:       uuid.NewString(),
+		EventType:     eventType,
+		OrderID:       order.ID,
+		CustomerEmail: order.CustomerEmail,
+		TotalCents:    order.TotalCents,
+		Reason:        reason,
+		OccurredAt:    time.Now().UTC(),
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload)
+		VALUES ($1, 'order', $2, $3, $4)`, event.EventID, order.ID, eventType, payload)
+	return err
+}
+
+func (r *Repository) inTx(ctx context.Context, fn func(pgx.Tx) (*domain.Order, error)) (*domain.Order, error) {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	order, err := fn(tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	if order.Items == nil {
+		if order.Items, err = r.items(ctx, order.ID); err != nil {
+			return nil, err
+		}
+	}
+	return order, nil
+}
+
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+func (r *Repository) getBy(ctx context.Context, q querier, where string, arg any) (*domain.Order, error) {
+	order, err := scanOrder(q.QueryRow(ctx, `SELECT `+orderColumns+` FROM orders WHERE `+where, arg))
+	if err != nil {
+		return nil, err
+	}
+	if order.Items, err = r.items(ctx, order.ID); err != nil {
 		return nil, err
 	}
 	return order, nil
 }
 
-func (r *Repository) SaveReserved(ctx context.Context, orderID string, items []domain.Item, totalCents int64) (*domain.Order, error) {
-	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	for _, item := range items {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO order_items
-				(id, order_id, product_id, product_name, quantity, unit_price_cents, subtotal_cents)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			uuid.NewString(), orderID, item.ProductID, item.ProductName, item.Quantity, item.UnitPriceCents, item.SubtotalCents); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE orders
-		SET status = $1, total_cents = $2, updated_at = now()
-		WHERE id = $3`,
-		domain.StatusStockReserved, totalCents, orderID); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return r.Get(ctx, orderID)
-}
-
-func (r *Repository) MarkFailed(ctx context.Context, orderID string, reason string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE orders
-		SET status = $1, failure_reason = $2, updated_at = now()
-		WHERE id = $3`, domain.StatusFailed, reason, orderID)
-	return err
-}
-
-func (r *Repository) MarkPaidAndCreateOutbox(ctx context.Context, order *domain.Order) (*domain.Order, error) {
-	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx, `
-		UPDATE orders
-		SET status = $1, updated_at = now()
-		WHERE id = $2`, domain.StatusPaid, order.ID); err != nil {
-		return nil, err
-	}
-
-	payload, err := json.Marshal(map[string]any{
-		"order_id":       order.ID,
-		"customer_email": order.CustomerEmail,
-		"total_cents":    order.TotalCents,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO outbox_events
-			(id, aggregate_type, aggregate_id, event_type, payload, status)
-		VALUES ($1, 'order', $2, 'order.paid', $3, 'pending')`,
-		uuid.NewString(), order.ID, payload); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return r.Get(ctx, order.ID)
-}
-
-func (r *Repository) Get(ctx context.Context, orderID string) (*domain.Order, error) {
-	var order domain.Order
-	err := r.db.QueryRow(ctx, `
-		SELECT id, customer_email, status, total_cents, failure_reason, created_at, updated_at
-		FROM orders
-		WHERE id = $1`, orderID).
-		Scan(&order.ID, &order.CustomerEmail, &order.Status, &order.TotalCents, &order.FailureReason, &order.CreatedAt, &order.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-
+func (r *Repository) items(ctx context.Context, orderID string) ([]domain.Item, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT product_id, product_name, quantity, unit_price_cents, subtotal_cents
-		FROM order_items
-		WHERE order_id = $1
-		ORDER BY product_name`, orderID)
+		FROM order_items WHERE order_id = $1 ORDER BY product_id`, orderID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
+	items := []domain.Item{}
 	for rows.Next() {
 		var item domain.Item
 		if err := rows.Scan(&item.ProductID, &item.ProductName, &item.Quantity, &item.UnitPriceCents, &item.SubtotalCents); err != nil {
 			return nil, err
 		}
-		order.Items = append(order.Items, item)
+		items = append(items, item)
 	}
-	return &order, rows.Err()
+	return items, rows.Err()
 }
 
-func (r *Repository) PendingOutbox(ctx context.Context, limit int) ([]domain.OutboxEvent, error) {
-	rows, err := r.db.Query(ctx, `
-		SELECT id, event_type, payload
-		FROM outbox_events
-		WHERE status = 'pending'
-		ORDER BY created_at
-		LIMIT $1`, limit)
+func (r *Repository) list(ctx context.Context, sql string, args ...any) ([]domain.Order, error) {
+	rows, err := r.db.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var events []domain.OutboxEvent
+	var orders []domain.Order
 	for rows.Next() {
-		var event domain.OutboxEvent
-		if err := rows.Scan(&event.ID, &event.EventType, &event.Payload); err != nil {
+		order, err := scanOrder(rows)
+		if err != nil {
 			return nil, err
 		}
-		events = append(events, event)
+		orders = append(orders, *order)
 	}
-	return events, rows.Err()
+	return orders, rows.Err()
 }
 
-func (r *Repository) MarkOutboxPublished(ctx context.Context, eventID string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET status = 'published', published_at = now()
-		WHERE id = $1`, eventID)
-	return err
-}
-
-func (r *Repository) MarkOutboxFailed(ctx context.Context, eventID string, reason string) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE outbox_events
-		SET attempts = attempts + 1, last_error = $2, status = CASE WHEN attempts >= 9 THEN 'failed' ELSE 'pending' END
-		WHERE id = $1`, eventID, reason)
-	return err
+func scanOrder(row pgx.Row) (*domain.Order, error) {
+	var o domain.Order
+	err := row.Scan(&o.ID, &o.CustomerEmail, &o.Status, &o.TotalCents, &o.FailureReason, &o.PaymentKey, &o.ExpiresAt, &o.CreatedAt, &o.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" { // invalid input syntax
+		return nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &o, nil
 }

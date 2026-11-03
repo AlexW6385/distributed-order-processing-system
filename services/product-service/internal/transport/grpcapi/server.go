@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 
 	productv1 "github.com/AlexW6385/distributed-order-processing-system/gen/product/v1"
 	"github.com/AlexW6385/distributed-order-processing-system/services/product-service/internal/domain"
@@ -22,7 +23,7 @@ func New(service *service.Service) *Server {
 func (s *Server) ListProducts(ctx context.Context, _ *productv1.ListProductsRequest) (*productv1.ListProductsResponse, error) {
 	products, err := s.service.ListProducts(ctx)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, toStatus(err)
 	}
 	out := make([]*productv1.Product, 0, len(products))
 	for _, product := range products {
@@ -44,26 +45,8 @@ func (s *Server) ReserveStock(ctx context.Context, req *productv1.ReserveStockRe
 	}
 	items, total, err := s.service.ReserveStock(ctx, req.OrderId, lines)
 	if err != nil {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
+		return nil, toStatus(err)
 	}
-	return &productv1.ReserveStockResponse{Items: toProtoItems(items), TotalCents: total}, nil
-}
-
-func (s *Server) ReleaseReservation(ctx context.Context, req *productv1.ReleaseReservationRequest) (*productv1.ReleaseReservationResponse, error) {
-	if err := s.service.ReleaseReservation(ctx, req.OrderId); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	return &productv1.ReleaseReservationResponse{}, nil
-}
-
-func (s *Server) ConfirmReservation(ctx context.Context, req *productv1.ConfirmReservationRequest) (*productv1.ConfirmReservationResponse, error) {
-	if err := s.service.ConfirmReservation(ctx, req.OrderId); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	return &productv1.ConfirmReservationResponse{}, nil
-}
-
-func toProtoItems(items []domain.ReservedItem) []*productv1.ReservedItem {
 	out := make([]*productv1.ReservedItem, 0, len(items))
 	for _, item := range items {
 		out = append(out, &productv1.ReservedItem{
@@ -74,5 +57,18 @@ func toProtoItems(items []domain.ReservedItem) []*productv1.ReservedItem {
 			SubtotalCents:  item.SubtotalCents,
 		})
 	}
-	return out
+	return &productv1.ReserveStockResponse{Items: out, TotalCents: total}, nil
+}
+
+func toStatus(err error) error {
+	switch {
+	case errors.Is(err, domain.ErrInvalid):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, domain.ErrNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, domain.ErrInsufficientStock), errors.Is(err, domain.ErrReservationClosed):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
+	}
 }

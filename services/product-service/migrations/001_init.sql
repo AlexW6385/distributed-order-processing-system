@@ -1,24 +1,34 @@
-CREATE TABLE IF NOT EXISTS products (
+CREATE TABLE products (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
     price_cents BIGINT NOT NULL CHECK (price_cents > 0),
+    -- Stock that can still be reserved. The CHECK makes overselling impossible
+    -- even if application logic is wrong.
     stock INTEGER NOT NULL CHECK (stock >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS stock_reservations (
-    id TEXT PRIMARY KEY,
-    order_id TEXT NOT NULL,
+-- One row per order. A row in status 'released' with no items is a tombstone:
+-- the order was released before its reservation arrived, so a late
+-- ReserveStock call for that order must be rejected.
+CREATE TABLE reservations (
+    order_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'confirmed', 'released')),
+    total_cents BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE reservation_items (
+    order_id TEXT NOT NULL REFERENCES reservations(order_id) ON DELETE CASCADE,
     product_id TEXT NOT NULL REFERENCES products(id),
+    product_name TEXT NOT NULL,
     quantity INTEGER NOT NULL CHECK (quantity > 0),
     unit_price_cents BIGINT NOT NULL CHECK (unit_price_cents > 0),
     subtotal_cents BIGINT NOT NULL CHECK (subtotal_cents > 0),
-    status TEXT NOT NULL CHECK (status IN ('reserved', 'confirmed', 'released')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (order_id, product_id)
+    PRIMARY KEY (order_id, product_id)
 );
 
 INSERT INTO products (id, name, description, price_cents, stock) VALUES

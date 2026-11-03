@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	orderv1 "github.com/AlexW6385/distributed-order-processing-system/gen/order/v1"
 	"github.com/AlexW6385/distributed-order-processing-system/services/order-service/internal/domain"
@@ -24,27 +26,48 @@ func (s *Server) CreateOrder(ctx context.Context, req *orderv1.CreateOrderReques
 	for _, item := range req.Items {
 		input = append(input, domain.ItemInput{ProductID: item.ProductId, Quantity: item.Quantity})
 	}
-	order, err := s.service.CreateOrder(ctx, req.CustomerEmail, input)
-	if err != nil {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
-	}
-	return &orderv1.OrderResponse{Order: toProto(order)}, nil
+	order, err := s.service.CreateOrder(ctx, service.CreateInput{
+		CustomerEmail:  req.CustomerEmail,
+		Items:          input,
+		IdempotencyKey: req.IdempotencyKey,
+	})
+	return respond(order, err)
 }
 
 func (s *Server) GetOrder(ctx context.Context, req *orderv1.GetOrderRequest) (*orderv1.OrderResponse, error) {
-	order, err := s.service.GetOrder(ctx, req.OrderId)
+	return respond(s.service.GetOrder(ctx, req.OrderId))
+}
+
+func (s *Server) PayOrder(ctx context.Context, req *orderv1.PayOrderRequest) (*orderv1.OrderResponse, error) {
+	return respond(s.service.PayOrder(ctx, req.OrderId, req.IdempotencyKey))
+}
+
+func (s *Server) CancelOrder(ctx context.Context, req *orderv1.CancelOrderRequest) (*orderv1.OrderResponse, error) {
+	return respond(s.service.CancelOrder(ctx, req.OrderId))
+}
+
+func respond(order *domain.Order, err error) (*orderv1.OrderResponse, error) {
 	if err != nil {
-		return nil, status.Error(codes.NotFound, err.Error())
+		return nil, toStatus(err)
 	}
 	return &orderv1.OrderResponse{Order: toProto(order)}, nil
 }
 
-func (s *Server) PayOrder(ctx context.Context, req *orderv1.PayOrderRequest) (*orderv1.OrderResponse, error) {
-	order, err := s.service.PayOrder(ctx, req.OrderId, req.IdempotencyKey)
-	if err != nil {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
+func toStatus(err error) error {
+	switch {
+	case errors.Is(err, domain.ErrInvalid):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, domain.ErrNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, domain.ErrConflict), errors.Is(err, domain.ErrRejected):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, domain.ErrUnavailable):
+		return status.Error(codes.Unavailable, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
 	}
-	return &orderv1.OrderResponse{Order: toProto(order)}, nil
 }
 
 func toProto(order *domain.Order) *orderv1.Order {
@@ -58,14 +81,18 @@ func toProto(order *domain.Order) *orderv1.Order {
 			SubtotalCents:  item.SubtotalCents,
 		})
 	}
-	return &orderv1.Order{
+	out := &orderv1.Order{
 		Id:            order.ID,
 		CustomerEmail: order.CustomerEmail,
 		Status:        order.Status,
 		TotalCents:    order.TotalCents,
 		Items:         items,
 		FailureReason: order.FailureReason,
-		CreatedAt:     order.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
-		UpdatedAt:     order.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
+		CreatedAt:     order.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:     order.UpdatedAt.UTC().Format(time.RFC3339),
 	}
+	if order.ExpiresAt != nil {
+		out.ExpiresAt = order.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	return out
 }

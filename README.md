@@ -1,132 +1,95 @@
 # Distributed Order Processing System
 
-An order checkout system built as five Go services. It handles stock reservation, payment and notifications without distributed transactions, and stays consistent when requests are retried, run concurrently, time out or crash halfway.
+A checkout system built from five Go services. It reserves stock, takes payments, refunds them and sends notifications, and stays consistent through retries, timeouts, crashes, concurrent requests and injected network faults. It runs on Kubernetes with full tracing and metrics.
 
-- **Saga with an explicit state machine.** Every state change is a guarded `UPDATE ... WHERE status = ...`, so concurrent requests and background workers cannot both move the same order.
-- **Transactional outbox.** State changes and their events commit in one transaction. A publisher relays them to Kafka using `FOR UPDATE SKIP LOCKED`, so several replicas can publish safely.
-- **Compensation through events.** Product-service consumes order events to confirm or release stock. A release that arrives before its reservation leaves a tombstone, so the late reservation is rejected.
-- **Idempotency at every hop.** Create and pay accept an `Idempotency-Key`. Reservations are keyed by order, payments are keyed by order, and notifications are deduplicated in an inbox table.
-- **Unknown outcomes are handled.** When a payment call times out, the order waits in `payment_pending` and a recovery worker retries until it gets a definite answer. Unpaid reservations expire.
-- **Database per service**, with migrations embedded and applied at startup.
-- **Deadlines on every gRPC call**, client-side round-robin load balancing, request-ID propagation, and a Redis-backed rate limiter at the gateway.
-- **Redis catalog cache** (cache-aside) with singleflight to stop cache stampedes, plus invalidation whenever stock changes.
+| Design | What it guarantees |
+| --- | --- |
+| **Saga + state machine** with guarded transitions | Only one actor can move an order out of a state; failures are compensated |
+| **Transactional outbox** to Kafka, `SKIP LOCKED` relay | A state change and its event commit together; no lost events |
+| **Idempotency everywhere**: request keys, order-keyed charges and reservations, inbox dedup, tombstones | Retries and redeliveries never double-apply |
+| **Unknown outcomes + recovery worker** | A timed-out charge is retried until definite; never charged twice |
+| **Circuit breaker, retries with jitter, per-hop deadlines** | Outages fail fast, and nothing waits forever |
+| **Row locks + CHECK**, **Redis flash-sale gate** (Lua) | No overselling; hot products do not serialize every buyer on one row |
+| **Refunds, double-entry ledger, reconciliation job** | Every money movement balances and matches an order |
+| **OpenTelemetry + Prometheus + Grafana** | One trace per checkout across HTTP, gRPC and Kafka; RED and domain metrics; alerts |
+| **Kubernetes** (Kustomize): probes, HPA, PDB, CronJob | Deployable and scalable; CI deploys to kind |
+
+The design and every failure case are explained in [docs/design.md](docs/design.md).
 
 ## Architecture
 
 ```text
-                    HTTP/JSON
-Client ───────────▶ api-gateway ── Redis (rate limit)
-                        │ gRPC
-              ┌─────────┴──────────┐
-              ▼                    ▼
-        order-service ──gRPC──▶ product-service ◀─┐
-         │   │    └─gRPC──▶ payment-service       │ confirm / release
-         │   │ outbox                              │
-         │   ▼                                     │
-         │ Kafka topic order.events (keyed by order id)
-         │   │                                     │
-         │   └─────────────────────────────────────┤
-         │                                         ▼
-         │                               notification-service
-         ▼
-  orders DB      products DB      payments DB      notifications DB
+client ─HTTP─▶ api-gateway ── Redis (rate limit)
+                  │ gRPC: deadlines, retries, circuit breaker
+        ┌─────────┴─────────┐
+        ▼                   ▼
+  order-service ──gRPC──▶ product-service ── Redis (catalog cache, flash-sale gate)
+   saga, outbox,  ──gRPC──▶ payment-service (charges, refunds, double-entry ledger)
+   recovery
+        │ outbox
+        ▼
+  Kafka order.events ──▶ product-service       confirm / release / restock stock
+                     ──▶ notification-service  inbox dedup, notifications
+
+  reconciler (CronJob) checks orders against payments and the ledger
+  all services ─▶ Jaeger (traces), Prometheus (metrics) ─▶ Grafana
 ```
 
-| Service | Owns | Talks to |
-| --- | --- | --- |
-| `api-gateway` | HTTP API, rate limiting, request IDs | order, product (gRPC) |
-| `order-service` | order state machine, saga, outbox, recovery worker | product, payment (gRPC); Kafka (produce) |
-| `product-service` | catalog, stock, reservations, catalog cache | Kafka (consume `order.events`); Redis |
-| `payment-service` | payments (simulated provider) | none |
-| `notification-service` | inbox, sent notifications | Kafka (consume `order.events`) |
+Each service has its own Postgres database and talks to the others only through gRPC and Kafka.
 
-Each service has its own database. Services share data only through gRPC and Kafka. See [docs/design.md](docs/design.md) for the order lifecycle, the failure cases, and how each one is handled.
+## Run it
 
-## Run locally
+**Docker Compose**
 
 ```bash
-cp .env.example .env
-make up                 # build and start everything
-./scripts/smoke.sh      # end-to-end checks (needs curl and jq)
+make up                       # services, Postgres, Kafka, Redis, Jaeger, Prometheus, Grafana, Toxiproxy
+make smoke                    # end-to-end API checks
 ```
 
-The gateway listens on `http://localhost:8080`. Run `make reset` to wipe all data.
+**Kubernetes** (any cluster; for example `kind create cluster`)
 
 ```bash
-curl localhost:8080/products
-
-# Create an order (stock is reserved for ORDER_PAYMENT_WINDOW, default 15m)
-curl -X POST localhost:8080/orders \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: create-123' \
-  -d '{"customer_email":"alex@example.com","items":[{"product_id":"prod-coffee-001","quantity":2}]}'
-
-# Pay: 200 when settled, 202 while the payment outcome is still unknown
-curl -X POST localhost:8080/orders/{order_id}/pay -H 'Idempotency-Key: pay-123'
-
-curl localhost:8080/orders/{order_id}
-curl -X POST localhost:8080/orders/{order_id}/cancel
+make k8s-up                   # build the image and apply deploy/k8s/dev
+kubectl -n order-system port-forward svc/api-gateway 8080
 ```
 
-The full API is in [openapi.yaml](openapi.yaml).
-
-### Try the failure modes
-
-| Setting (`.env`) | Effect |
+| UI | Address (Compose) |
 | --- | --- |
-| `PAYMENT_FAULT_RATE=0.5` | Half of the charges succeed but answer after the caller's deadline. Pay returns `202 payment_pending`, and the recovery worker settles the order a few seconds later without charging twice. |
-| `PAYMENT_DECLINE_ABOVE_CENTS=5000` | Larger orders are declined. The order fails, and its stock comes back through `order.failed`. |
-| `ORDER_PAYMENT_WINDOW=30s` | Unpaid orders expire quickly, and their stock is released. |
-| `RATE_LIMIT_PER_MINUTE=5` | The gateway starts answering 429. |
-
-Run `make scale` to start three order-service replicas and two product-service replicas. The outbox publishers and recovery workers coordinate through the database, and the Kafka consumer group splits `order.events` partitions across the product-service replicas.
-
-## Performance
-
-`loadtest/` measures throughput while checking invariants (`make bench-*`; see [docs/benchmarks.md](docs/benchmarks.md)). CI runs it against the full Compose stack, with real Kafka, on a 4 vCPU runner:
-
-- **~600 paid orders/s at 111 ms p95** with 50 concurrent users (two HTTP requests per order)
-- **zero overselling** with 1,000 simultaneous orders for 100 units
-- with **30% of payments timing out**, all 500 orders settled with **zero double charges**
-
-## Tests
+| API | http://localhost:8080 ([openapi.yaml](openapi.yaml)) |
+| Grafana dashboard | http://localhost:3000 |
+| Jaeger traces | http://localhost:16686 |
+| Prometheus | http://localhost:9090 |
 
 ```bash
-make test                # unit tests; database tests are skipped
-make test-integration    # with Postgres from `make up`: concurrency and failure tests
+curl -X POST localhost:8080/orders -H 'Content-Type: application/json' -H 'Idempotency-Key: k1' \
+  -d '{"customer_email":"alex@example.com","items":[{"product_id":"prod-coffee-001","quantity":2}]}'
+curl -X POST localhost:8080/orders/{id}/pay -H 'Idempotency-Key: pay-1'   # 200 paid, 202 settling, 503 retry
+curl -X POST localhost:8080/orders/{id}/refund
+curl -X POST localhost:8080/admin/flash-sales -d '{"product_id":"prod-headphones-014","stock":100}'
 ```
 
-The integration tests run against a real Postgres, with a fresh database per test. They cover:
+Each response carries `X-Trace-Id`; paste it into Jaeger to see the request across every service, Kafka included.
 
-- concurrent pay on one order (exactly one charge, final state paid)
-- unknown payment outcome followed by recovery
-- reservation expiry, cancel racing pay, and stuck pending orders
-- overselling under concurrent reservations, and deadlock freedom for overlapping orders
-- a release arriving before its reservation (tombstone)
-- several outbox publishers draining one outbox without duplicates
-- inbox deduplication of redelivered events
+## Testing
 
-CI runs these tests, then builds the Compose stack and runs `scripts/smoke.sh` against it.
+| Layer | Command | Covers |
+| --- | --- | --- |
+| Unit + integration | `make test-integration` | Real Postgres and Redis, race detector: concurrent pay and refund, cancel vs pay, recovery, overselling, deadlocks, tombstones, concurrent outbox publishers, inbox, ledger balance, flash-sale gate, circuit breaker |
+| End to end | `go run ./loadtest smoke` | Every API path, including effects that arrive through Kafka |
+| Invariants | `go run ./loadtest verify` | Across all data: no stuck orders, one event per transition, reservations match orders, payments and ledger reconcile, one notification per event |
+| Load + chaos | `go run ./loadtest oversell / flashsale / checkout / faults / chaos` | No overselling; flash sale; throughput; 30% payment timeouts; Toxiproxy faults; then `verify` |
+
+CI deploys the whole system to a kind cluster and runs all of these, kills order-service and product-service pods mid-load, runs the reconciliation CronJob, and checks that metrics and traces arrive. Results: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Layout
 
 ```text
-proto/                    gRPC contracts (generated code in gen/)
-internal/contracts/events Kafka event contract shared by producer and consumers
-internal/platform/        shared plumbing: gRPC, Kafka consumer, migrations, config, logging
-services/<name>/
-  cmd/                    main
-  internal/domain         models, states, errors
-  internal/service        business rules
-  internal/repository     SQL
-  internal/transport      gRPC / Kafka boundaries
-  migrations/             schema owned by the service (embedded)
-deploy/postgres/          creates one database per service
-loadtest/                 load tests that also check invariants
-scripts/                  proto generation, smoke tests
-```
-
-```bash
-make proto   # regenerate gRPC code (protoc 29.3, protoc-gen-go 1.35.2, protoc-gen-go-grpc 1.5.1)
-make logs    # follow service logs
+services/<name>/          cmd/ main; internal/ domain, service, repository, transport; migrations/
+internal/platform/        gRPC (deadlines, retries, breaker, health), Kafka consumer, observability, migrations
+internal/contracts/       Kafka event contract
+internal/reconcile/       reconciliation rules, shared by the reconciler and the load tests
+proto/, gen/              gRPC contracts and generated code
+loadtest/                 end-to-end scenarios and invariant checks
+deploy/k8s/               Kustomize: base (services) and dev (plus infrastructure)
+deploy/observability/     Prometheus config and alerts, Grafana dashboard
 ```

@@ -1,17 +1,21 @@
 openapi: 3.0.3
 info:
   title: Distributed Order Processing System API
-  version: 2.0.0
+  version: 3.0.0
   description: |
     Public HTTP API served by api-gateway. Every response carries an
-    X-Request-ID header; send your own to correlate logs across services.
-    Requests are rate limited per client IP (429 when exceeded).
+    X-Trace-Id header: the OpenTelemetry trace of the request, viewable in
+    Jaeger. Requests are rate limited per client IP (429 when exceeded).
+
+    503 means a dependency is unavailable and the request had no effect (for
+    example, the payment circuit breaker is open); it is safe to retry.
+    202 means the outcome is not known yet and will settle in the background.
 servers:
   - url: http://localhost:8080
 paths:
-  /health:
+  /healthz:
     get:
-      summary: Health check
+      summary: Liveness and readiness probe
       responses:
         "200":
           description: Gateway is running
@@ -54,9 +58,9 @@ paths:
         "400":
           $ref: "#/components/responses/Error"
         "409":
-          description: Stock could not be reserved (for example, insufficient stock)
+          description: Stock could not be reserved (insufficient stock, flash sale sold out or limit reached)
         "503":
-          description: A dependency was unavailable; the order was failed and can be retried
+          description: A dependency was unavailable; the order was failed and can be retried with a new key
   /orders/{order_id}:
     get:
       summary: Get an order
@@ -105,6 +109,49 @@ paths:
           $ref: "#/components/responses/Error"
         "409":
           description: Order cannot be paid (cancelled, expired, failed, or past its payment window)
+        "503":
+          description: Payment service unavailable; nothing was charged and the order can be paid again
+  /orders/{order_id}/refund:
+    post:
+      summary: Refund a paid order in full and return its stock
+      description: |
+        Safe to retry; refunds at most once. Returns 202 with status
+        refund_pending while the outcome is unknown.
+      parameters:
+        - $ref: "#/components/parameters/OrderID"
+      responses:
+        "200":
+          description: Refunded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "202":
+          description: Refund outcome unknown; status is refund_pending
+        "409":
+          description: Order is not paid
+        "503":
+          description: Payment service unavailable; nothing was refunded
+  /admin/flash-sales:
+    post:
+      summary: Start a flash sale for a product
+      description: |
+        Sets the product's stock and puts it behind the Redis admission gate:
+        one unit per customer, and requests beyond the stock are rejected in
+        Redis without reaching Postgres. Unauthenticated (development only).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [product_id, stock]
+              properties:
+                product_id: {type: string, example: prod-headphones-014}
+                stock: {type: integer, minimum: 1, example: 100}
+      responses:
+        "200":
+          description: Sale started
   /orders/{order_id}/cancel:
     post:
       summary: Cancel a reserved order that has not started payment
@@ -187,7 +234,7 @@ components:
         customer_email: { type: string }
         status:
           type: string
-          enum: [pending, stock_reserved, payment_pending, paid, failed, expired, cancelled]
+          enum: [pending, stock_reserved, payment_pending, paid, failed, expired, cancelled, refund_pending, refunded]
         total_cents: { type: integer }
         failure_reason: { type: string }
         expires_at:
